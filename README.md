@@ -1,66 +1,101 @@
-# Günday's Cari Takip - Streamlit
+# Gündays Home Sipariş Takip Sistemi
 
-Google Sheets'i veri merkezi gibi kullanan cari takip paneli.
+Bu paket sıfırdan kurulmuş Streamlit + Google Sheets sipariş takip sistemidir.
 
-## Özellikler
+## En önemli fark
 
-- Dashboard: toplam satış, tahsilat, açık cari, firma bazlı bakiye
-- Satış girişi: cari, ürün, adet, fiyat, tahsilat, vade ve not
-- Tahsilat girişi: firmaya ödeme/tahsilat işleme
-- Cari detay: firma bazlı hareket dökümü ve notlar
-- Notlar: cari notu, vade hatırlatma, problem ve sevkiyat notu
-- Raporlar: tarih, cari ve ürün bazlı filtreleme + CSV indirme
-- Yönetim: yeni firma ve ürün ekleme
+Eski sürümlerde uygulama her sekme için tekrar tekrar başlık araması yaptığı için Google Sheets API kotasına çarpıyordu. Bu sürümde:
 
-## Bağlı Google Sheet
+- Ana dosya: `streamlit_app.py`
+- `src` klasörü yoktur.
+- Google Sheets verisi tek seferde `batch_get` ile okunur.
+- Okunan veri 120 saniye cache'lenir.
+- Başlıklar sabittir, her açılışta otomatik başlık arama yapılmaz.
+- Sheet kurulum/onarma işlemi sadece `Sheet Kurulum` sayfasındaki butonla manuel çalışır.
 
-Varsayılan spreadsheet ID:
+## GitHub repo kökünde olması gerekenler
 
 ```text
-1vIWF8SNBxS1pt47bmnvmsbxh0r-4q-5HweIkIDT0aZw
+streamlit_app.py
+app.py
+requirements.txt
+runtime.txt
+README.md
+secrets.example.toml
+.streamlit/config.toml
+.gitignore
 ```
 
-Uygulama şu sayfalarla çalışır:
+Şunları yükleme:
 
-- `CARI_HAREKETLER`
-- `FIRMALAR`
-- `URUNLER`
-- `AYARLAR`
-- `CARI_NOTLARI`
-
-Eksik kolon varsa uygulama otomatik olarak başlık satırına ekler.
-
-## Lokal kurulum
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate   # Windows
-# source .venv/bin/activate  # Mac/Linux
-pip install -r requirements.txt
+```text
+service-account.json
+*.json
+.streamlit/secrets.toml
 ```
 
-`.streamlit/secrets.toml.template` dosyasını kopyala:
+## Streamlit Cloud ayarı
 
-```bash
-copy .streamlit\secrets.toml.template .streamlit\secrets.toml
+Streamlit Cloud'da main file path:
+
+```text
+streamlit_app.py
 ```
 
-Sonra `secrets.toml` içine Google servis hesabı JSON bilgilerini gir.
+## Secrets kurulumu
 
-Çalıştır:
+Streamlit Cloud > App > Settings > Secrets içine `secrets.example.toml` formatını kullanarak kendi servis hesabı bilgilerini gir.
 
-```bash
-streamlit run app.py
+Örnek başlık:
+
+```toml
+SPREADSHEET_ID = "1nOIO-sodcXTx1v-dp1Do9Zj-mev6O5rbYkyT204m-Vk"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = """-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"""
+client_email = "..."
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+universe_domain = "googleapis.com"
 ```
 
-## Streamlit Cloud kurulumu
+## Google Sheet paylaşımı
 
-1. Bu klasörü GitHub reposuna yükle.
-2. `secrets.toml` dosyasını GitHub'a yükleme.
-3. Streamlit Cloud'da uygulamayı deploy et.
-4. App > Settings > Secrets alanına `secrets.toml` içeriğini yapıştır.
-5. Google Sheet'i servis hesabı e-posta adresiyle **Düzenleyici** olarak paylaş.
+Google servis hesabındaki `client_email` adresini Google Sheet'e **Düzenleyici** olarak ekle.
 
-## Güvenlik
+## İlk kurulum sırası
 
-Servis hesabı private key bilgisini kimseyle paylaşma. GitHub'a yükleme. `.gitignore` bu dosyayı özellikle dışarıda bırakır.
+1. GitHub reposunu temizle.
+2. Bu paketteki dosyaları repo köküne yükle.
+3. Streamlit Cloud'da main file path alanını `streamlit_app.py` yap.
+4. Secrets alanına servis hesabı bilgilerini gir.
+5. Google Sheet'i servis hesabı e-postasına düzenleyici olarak paylaş.
+6. Uygulamayı aç.
+7. Sol menüden `Sheet Kurulum` sayfasına gir.
+8. `Sheet yapısını oluştur / onar` butonuna bas.
+9. `Firmalar` ve `Ürünler` sayfalarından kayıt gir.
+10. `Yeni Sipariş` sayfasından sipariş oluştur.
+
+## Google Sheets beklenen sekmeler
+
+- Dashboard
+- Firmalar
+- Urunler
+- Siparisler
+- Siparis_Kalemleri
+- Odemeler
+- Listeler
+- Kullanim
+- Kullanicilar
+
+Detaylı kolon listesi için `SHEET_SCHEMA.md` dosyasına bak.
+
+## 429 quota hatası gelirse
+
+Google tarafında dakika kotası dolduğunda geçici olarak 429 hatası verir. Bu sürüm bunu azaltmak için tek batch okuma + cache kullanır. Yine de çok hızlı peş peşe refresh yaparsan 1-2 dakika bekleyip tekrar dene.

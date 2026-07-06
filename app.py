@@ -1,144 +1,135 @@
 from __future__ import annotations
 
 import re
-import uuid
-import unicodedata
+import time
 from datetime import date, datetime
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import gspread
 import pandas as pd
 import streamlit as st
+import gspread
+from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
-# =============================
-# GÜNDAY'S CARİ TAKİP - STREAMLIT
-# Google Sheet ID: Kullanıcının oluşturduğu "CARİ TAKİPP" dosyası
-# =============================
+# =====================================================
+# GÜNDAYS HOME - SİPARİŞ TAKİP SİSTEMİ
+# Tek dosya Streamlit uygulaması.
+# Google Sheets okuma mantığı: tek batch read + cache.
+# =====================================================
 
-DEFAULT_SPREADSHEET_ID = "1vIWF8SNBxS1pt47bmnvmsbxh0r-4q-5HweIkIDT0aZw"
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+DEFAULT_SPREADSHEET_ID = "1nOIO-sodcXTx1v-dp1Do9Zj-mev6O5rbYkyT204m-Vk"
+APP_TITLE = "Gündays Home Sipariş Takip"
+CACHE_TTL_SECONDS = 120
+MAX_ROWS_PER_SHEET = 10000
 
-WORKSHEETS = {
-    "hareketler": "CARI_HAREKETLER",
-    "firmalar": "FIRMALAR",
-    "urunler": "URUNLER",
-    "ayarlar": "AYARLAR",
-    "notlar": "CARI_NOTLARI",
+SCHEMA: Dict[str, List[str]] = {
+    "Dashboard": [
+        "Metrik", "Deger", "Aciklama"
+    ],
+    "Firmalar": [
+        "Firma_ID", "Firma_Adi", "Yetkili", "Telefon", "Email", "Adres", "Il", "Ilce",
+        "Vergi_Dairesi", "VKN_TCKN", "Durum", "Kayit_Tarihi", "Not"
+    ],
+    "Urunler": [
+        "Urun_ID", "Urun_Adi", "Kategori", "Renk", "Birim", "Birim_Fiyat", "KDV_Orani",
+        "Durum", "Stok_Kodu", "Not"
+    ],
+    "Siparisler": [
+        "Siparis_ID", "Tarih", "Firma_ID", "Firma_Adi", "Durum", "Teslim_Tarihi", "Sevk_Adresi",
+        "Ara_Toplam", "KDV_Tutari", "Genel_Toplam", "Odenen", "Kalan", "Odeme_Durumu",
+        "Not", "Olusturma_Tarihi"
+    ],
+    "Siparis_Kalemleri": [
+        "Kalem_ID", "Siparis_ID", "Urun_ID", "Urun_Adi", "Miktar", "Birim_Fiyat", "KDV_Orani",
+        "Ara_Toplam", "KDV_Tutari", "Satir_Toplami", "Not"
+    ],
+    "Odemeler": [
+        "Odeme_ID", "Tarih", "Siparis_ID", "Firma_ID", "Firma_Adi", "Odeme_Tipi", "Tutar", "Aciklama"
+    ],
+    "Listeler": [
+        "Durum_Tipleri", "Odeme_Tipleri", "Urun_Kategorileri", "Birimler"
+    ],
+    "Kullanim": [
+        "Tarih", "Islem", "Kullanici", "Detay"
+    ],
+    "Kullanicilar": [
+        "Kullanici_ID", "Ad_Soyad", "Email", "Rol", "Durum"
+    ],
 }
 
-HAREKET_COLUMNS = [
-    "ID",
-    "Tarih",
-    "Cari",
-    "Islem_Tipi",
-    "Urun",
-    "Renk",
-    "Adet",
-    "Birim_Fiyat",
-    "Tutar",
-    "Odeme_Turu",
-    "Tahsil_Edilen",
-    "Kalan",
-    "Odeme_Tarihi",
-    "Not",
-    "Ek_Not",
-    "Kayit_Zamani",
-    "Kullanici",
+DEFAULT_LIST_ROWS = [
+    ["Hazırlanıyor", "Nakit", "Dilsiz Uşak", "Adet"],
+    ["Onaylandı", "Havale/EFT", "Mobilya", "Takım"],
+    ["Üretimde", "Kredi Kartı", "Aksesuar", "Paket"],
+    ["Sevke Hazır", "Çek/Senet", "Diğer", "Koli"],
+    ["Teslim Edildi", "Diğer", "", "Metre"],
+    ["İptal", "", "", "Kg"],
 ]
 
-NOT_COLUMNS = [
-    "ID",
-    "Tarih",
-    "Cari",
-    "Not_Tipi",
-    "Not_Detayi",
-    "Hatirlatma_Tarihi",
-    "Durum",
-    "Kullanici",
-    "Kayit_Zamani",
-]
-
-FIRMA_COLUMNS = [
-    "Firma_ID",
-    "Firma_Adi",
-    "Tip",
-    "Telefon",
-    "Adres",
-    "Vergi_No",
-    "Vergi_Dairesi",
-    "Durum",
-    "Not",
-]
-
-URUN_COLUMNS = [
-    "Urun_ID",
-    "Urun_Adi",
-    "Renk",
-    "Varsayilan_Fiyat",
-    "Durum",
-    "Not",
-]
-
-AYAR_DEFAULTS = {
-    "Odeme_Turu": ["Açık Cari", "Nakit", "Kart", "Havale/EFT", "Çek/Senet"],
-    "Islem_Tipi": ["Satış", "Tahsilat", "İade", "Düzeltme"],
-    "Not_Tipi": ["Genel Not", "Tahsilat Notu", "Vade Hatırlatma", "Sevkiyat", "Problem", "İade", "Özel Not"],
-    "Durum": ["Açık", "Tamamlandı", "İptal"],
+ALIASES: Dict[str, List[str]] = {
+    "Firma_ID": ["firma id", "firma_id", "firma kodu", "firma no", "id"],
+    "Firma_Adi": ["firma adı", "firma adi", "firma_adi", "firma", "cari", "cari adı", "cari adi", "müşteri", "musteri"],
+    "Urun_ID": ["ürün id", "urun id", "urun_id", "ürün_id", "ürün kodu", "urun kodu", "stok kodu"],
+    "Urun_Adi": ["ürün adı", "urun adi", "urun_adi", "ürün", "urun", "ürün ismi", "urun ismi"],
+    "Siparis_ID": ["sipariş id", "siparis id", "siparis_id", "sipariş_id", "sipariş no", "siparis no"],
+    "Kalem_ID": ["kalem id", "kalem_id", "satır id", "satir id"],
+    "Odeme_ID": ["ödeme id", "odeme id", "odeme_id", "ödeme_id"],
+    "Tarih": ["tarih", "sipariş tarihi", "siparis tarihi"],
+    "Durum": ["durum", "status", "sipariş durumu", "siparis durumu"],
+    "Birim_Fiyat": ["birim fiyat", "birim_fiyat", "fiyat", "satış fiyatı", "satis fiyati"],
+    "KDV_Orani": ["kdv", "kdv oranı", "kdv orani", "kdv_orani", "kdv %"],
+    "Genel_Toplam": ["genel toplam", "genel_toplam", "toplam", "toplam tutar", "toplam_tutar", "ciro"],
+    "Satir_Toplami": ["satır toplamı", "satir toplami", "satir_toplami", "satır_toplamı", "toplam"],
+    "Odenen": ["ödenen", "odenen", "odenmiş", "ödenmiş"],
+    "Kalan": ["kalan", "bakiye"],
+    "Tutar": ["tutar", "ödeme tutarı", "odeme tutari"],
 }
 
-# ---------- Genel yardımcılar ----------
+# -------------------------------
+# Genel yardımcılar
+# -------------------------------
 
 def normalize_key(value: Any) -> str:
-    """Türkçe karakter, boşluk ve özel karakter farklarını kaldırıp kolonları eşleştirir."""
-    if value is None:
-        return ""
-    text = str(value).strip()
-    replacements = {
-        "İ": "I",
-        "I": "I",
-        "ı": "i",
-        "Ğ": "G",
-        "ğ": "g",
-        "Ü": "U",
-        "ü": "u",
-        "Ş": "S",
-        "ş": "s",
-        "Ö": "O",
-        "ö": "o",
-        "Ç": "C",
-        "ç": "c",
-    }
-    for src, target in replacements.items():
-        text = text.replace(src, target)
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    text = text.lower()
+    text = str(value or "").strip().lower()
+    tr_map = str.maketrans("çğıöşüİ", "cgiosui")
+    text = text.translate(tr_map)
     text = re.sub(r"[^a-z0-9]+", "_", text)
     return text.strip("_")
 
 
-def now_str() -> str:
-    return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def new_id(prefix: str) -> str:
-    return f"{prefix}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+def date_text(d: Any) -> str:
+    if isinstance(d, datetime):
+        return d.strftime("%Y-%m-%d")
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    return str(d or "")
+
+
+def money(value: Any) -> str:
+    n = to_float(value)
+    return f"{n:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def to_float(value: Any) -> float:
-    if value is None or value == "":
+    if value is None:
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
     text = str(value).strip()
-    text = text.replace("TL", "").replace("₺", "").replace(" ", "")
+    if not text:
+        return 0.0
+    text = text.replace("TL", "").replace("₺", "").replace("%", "").strip()
     text = re.sub(r"[^0-9,.-]", "", text)
-    if text.count(",") == 1 and text.count(".") >= 1:
+    if not text:
+        return 0.0
+    # Türkçe sayı: 12.345,67 -> 12345.67
+    if "," in text and "." in text:
         text = text.replace(".", "").replace(",", ".")
-    elif text.count(",") == 1 and text.count(".") == 0:
+    elif "," in text:
         text = text.replace(",", ".")
     try:
         return float(text)
@@ -146,768 +137,750 @@ def to_float(value: Any) -> float:
         return 0.0
 
 
-def money(value: Any) -> str:
-    amount = to_float(value)
-    return f"{amount:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
+def clean_empty_rows(df: pd.DataFrame, required_col: Optional[str] = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy().fillna("")
+    if required_col and required_col in df.columns:
+        df = df[df[required_col].astype(str).str.strip() != ""]
+    else:
+        df = df[df.apply(lambda row: any(str(x).strip() for x in row), axis=1)]
+    return df.reset_index(drop=True)
 
 
-def parse_date_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, dayfirst=True, errors="coerce")
+def col_letter(index_1_based: int) -> str:
+    result = ""
+    n = index_1_based
+    while n:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
 
 
-def clean_str(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
+def next_id(df: pd.DataFrame, column: str, prefix: str) -> str:
+    max_num = 0
+    if column in df.columns:
+        for raw in df[column].astype(str).tolist():
+            nums = re.findall(r"\d+", raw)
+            if nums:
+                max_num = max(max_num, int(nums[-1]))
+    return f"{prefix}-{max_num + 1:05d}"
 
 
-# ---------- Google Sheets bağlantısı ----------
+def find_header_alias_map(actual_headers: List[str], expected_headers: List[str]) -> Dict[str, str]:
+    actual_norm_to_name = {normalize_key(h): h for h in actual_headers if str(h).strip()}
+    rename_map: Dict[str, str] = {}
+    for expected in expected_headers:
+        candidates = [expected] + ALIASES.get(expected, [])
+        for candidate in candidates:
+            key = normalize_key(candidate)
+            if key in actual_norm_to_name:
+                rename_map[actual_norm_to_name[key]] = expected
+                break
+    return rename_map
+
+
+# -------------------------------
+# Google Sheets bağlantısı
+# -------------------------------
+
+def get_secret_value(*names: str, default: Optional[str] = None) -> Optional[str]:
+    for name in names:
+        try:
+            val = st.secrets.get(name)
+        except Exception:
+            val = None
+        if val:
+            return str(val)
+    return default
+
+
+def get_spreadsheet_id() -> str:
+    return get_secret_value("SPREADSHEET_ID", "spreadsheet_id", default=DEFAULT_SPREADSHEET_ID) or DEFAULT_SPREADSHEET_ID
+
+
+def get_service_account_info() -> Dict[str, Any]:
+    # Streamlit Cloud secrets içinde en sağlıklı format:
+    # [gcp_service_account]
+    # type = "service_account"
+    for section_name in ["gcp_service_account", "service_account", "google_service_account"]:
+        try:
+            if section_name in st.secrets:
+                return dict(st.secrets[section_name])
+        except Exception:
+            pass
+
+    # Alternatif: tüm servis hesabı alanları root seviyede ise.
+    required = [
+        "type", "project_id", "private_key_id", "private_key", "client_email", "client_id",
+        "auth_uri", "token_uri", "auth_provider_x509_cert_url", "client_x509_cert_url"
+    ]
+    info = {}
+    for key in required:
+        try:
+            if key in st.secrets:
+                info[key] = st.secrets[key]
+        except Exception:
+            pass
+    if all(k in info for k in required):
+        return dict(info)
+
+    raise RuntimeError("Streamlit Secrets içinde Google service account bilgisi bulunamadı.")
+
 
 @st.cache_resource(show_spinner=False)
-def get_client() -> gspread.Client:
-    if "gcp_service_account" not in st.secrets:
-        st.error("Google servis hesabı bilgisi bulunamadı. `.streamlit/secrets.toml` veya Streamlit Cloud Secrets içine eklemen gerekiyor.")
-        st.stop()
-    creds_info = dict(st.secrets["gcp_service_account"])
-    credentials = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+def get_gspread_client() -> gspread.Client:
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    info = get_service_account_info()
+    if "private_key" in info:
+        # Streamlit secrets bazen \n karakterlerini düz metin saklar.
+        info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
+    credentials = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(credentials)
 
 
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet() -> gspread.Spreadsheet:
-    spreadsheet_id = st.secrets.get("spreadsheet_id", DEFAULT_SPREADSHEET_ID)
-    client = get_client()
-    return client.open_by_key(spreadsheet_id)
+    client = get_gspread_client()
+    return client.open_by_key(get_spreadsheet_id())
 
 
-def get_or_create_ws(name: str, required_cols: List[str], rows: int = 1000, cols: int = 30) -> gspread.Worksheet:
-    ss = get_spreadsheet()
-    try:
-        ws = ss.worksheet(name)
-    except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=name, rows=rows, cols=cols)
-        ws.update("A1", [required_cols])
-        return ws
-    ensure_columns(ws, required_cols)
-    return ws
+def run_google_call(fn, *args, retries: int = 4, **kwargs):
+    delay = 1.0
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as exc:
+            last_error = exc
+            msg = str(exc)
+            # 429 quota veya 5xx geçici hatalarda bekle.
+            if "429" in msg or "Quota exceeded" in msg or "500" in msg or "503" in msg:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    raise last_error
 
 
-def ensure_columns(ws: gspread.Worksheet, required_cols: List[str]) -> None:
-    headers = ws.row_values(1)
-    if not headers:
-        ws.update("A1", [required_cols])
-        return
+# -------------------------------
+# Sheet okuma/yazma
+# -------------------------------
 
-    existing_norm = {normalize_key(h): h for h in headers if clean_str(h)}
-    final_headers = list(headers)
-    changed = False
-    for col in required_cols:
-        if normalize_key(col) not in existing_norm:
-            final_headers.append(col)
-            changed = True
-    if changed:
-        ws.update("A1", [final_headers])
+def dataframe_from_values(sheet_name: str, values: List[List[Any]]) -> pd.DataFrame:
+    expected = SCHEMA[sheet_name]
+    if not values:
+        return pd.DataFrame(columns=expected)
 
-
-def worksheet_headers(ws: gspread.Worksheet) -> List[str]:
-    headers = ws.row_values(1)
-    return [h for h in headers if clean_str(h)]
-
-
-def read_sheet(name: str, required_cols: List[str]) -> pd.DataFrame:
-    ws = get_or_create_ws(name, required_cols)
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        return pd.DataFrame(columns=[normalize_key(c) for c in required_cols])
-
-    headers = values[0]
+    header = [str(x).strip() for x in values[0]]
     rows = values[1:]
-    df = pd.DataFrame(rows, columns=headers)
+    width = max(len(header), len(expected))
+    header = header + [f"Ek_{i}" for i in range(len(header) + 1, width + 1)]
 
-    # Boş satırları sil
-    df = df.dropna(how="all")
-    if not df.empty:
-        non_empty_mask = df.apply(lambda r: any(clean_str(x) for x in r), axis=1)
-        df = df[non_empty_mask]
+    normalized_rows = []
+    for row in rows:
+        row = list(row) + [""] * (width - len(row))
+        normalized_rows.append(row[:width])
 
-    # Kolonları normalize et, tekrar eden isim varsa suffix ver
-    normalized_cols = []
-    used = {}
-    for col in df.columns:
-        key = normalize_key(col)
-        if not key:
-            key = "bos_kolon"
-        if key in used:
-            used[key] += 1
-            key = f"{key}_{used[key]}"
-        else:
-            used[key] = 1
-        normalized_cols.append(key)
-    df.columns = normalized_cols
-    return df
+    df = pd.DataFrame(normalized_rows, columns=header[:width])
+    rename_map = find_header_alias_map(list(df.columns), expected)
+    df = df.rename(columns=rename_map)
 
-
-def append_record(name: str, required_cols: List[str], record: Dict[str, Any]) -> None:
-    ws = get_or_create_ws(name, required_cols)
-    headers = worksheet_headers(ws)
-    normalized_record = {normalize_key(k): v for k, v in record.items()}
-    row = [normalized_record.get(normalize_key(h), "") for h in headers]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-    clear_cached_data()
-
-
-def clear_cached_data() -> None:
-    read_hareketler.clear()
-    read_firmalar.clear()
-    read_urunler.clear()
-    read_notlar.clear()
-
-
-# ---------- Veri okuma ----------
-
-@st.cache_data(ttl=30, show_spinner=False)
-def read_hareketler() -> pd.DataFrame:
-    df = read_sheet(WORKSHEETS["hareketler"], HAREKET_COLUMNS)
-    return prepare_hareketler(df)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def read_firmalar() -> pd.DataFrame:
-    return read_sheet(WORKSHEETS["firmalar"], FIRMA_COLUMNS)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def read_urunler() -> pd.DataFrame:
-    return read_sheet(WORKSHEETS["urunler"], URUN_COLUMNS)
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def read_notlar() -> pd.DataFrame:
-    return read_sheet(WORKSHEETS["notlar"], NOT_COLUMNS)
-
-
-def get_ayar_list(key: str) -> List[str]:
-    # Ayarlar sayfasında farklı formatlar olabilir; güvenli varsayılan kullanıyoruz.
-    defaults = AYAR_DEFAULTS.get(key, [])
-    try:
-        df = read_sheet(WORKSHEETS["ayarlar"], [key])
-        nkey = normalize_key(key)
-        if nkey in df.columns:
-            values = [clean_str(x) for x in df[nkey].tolist() if clean_str(x)]
-            return values or defaults
-    except Exception:
-        pass
-    return defaults
-
-
-def prepare_hareketler(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        for col in ["tarih", "cari", "islem_tipi", "urun", "renk", "adet", "birim_fiyat", "tutar", "tahsil_edilen", "kalan"]:
-            if col not in df.columns:
-                df[col] = []
-        return df
-
-    # Olası eski kolon adlarını yakala
-    aliases = {
-        "tarih": ["tarih"],
-        "cari": ["cari", "firma", "firma_adi", "sube", "musteri", "odeme_tarihi"],
-        "islem_tipi": ["islem_tipi", "islem_turu", "tip"],
-        "urun": ["urun", "cinsi", "urun_adi"],
-        "renk": ["renk"],
-        "adet": ["adet"],
-        "birim_fiyat": ["birim_fiyat", "fiyat"],
-        "tutar": ["tutar", "toplam_tutar", "toplam"],
-        "tahsil_edilen": ["tahsil_edilen", "tahsilat", "odenen", "nakit", "kart"],
-        "kalan": ["kalan", "bakiye"],
-    }
-
-    for target, possible in aliases.items():
-        if target not in df.columns:
-            for p in possible:
-                if p in df.columns:
-                    df[target] = df[p]
-                    break
-        if target not in df.columns:
-            df[target] = ""
-
-    df["adet_num"] = df["adet"].apply(to_float)
-    df["birim_fiyat_num"] = df["birim_fiyat"].apply(to_float)
-    df["tutar_num"] = df["tutar"].apply(to_float)
-    df["tahsil_edilen_num"] = df["tahsil_edilen"].apply(to_float)
-
-    # Tutar boşsa adet x birim fiyat hesapla
-    empty_tutar = df["tutar_num"].eq(0) & df["adet_num"].gt(0) & df["birim_fiyat_num"].gt(0)
-    df.loc[empty_tutar, "tutar_num"] = df.loc[empty_tutar, "adet_num"] * df.loc[empty_tutar, "birim_fiyat_num"]
-
-    tip = df["islem_tipi"].fillna("").astype(str).map(normalize_key)
-    is_sale = tip.str.contains("satis", na=False) | tip.eq("")
-    is_collection = tip.str.contains("tahsil", na=False)
-    is_return = tip.str.contains("iade", na=False)
-    is_adjustment = tip.str.contains("duzelt", na=False)
-
-    df["satis_tutari"] = 0.0
-    df.loc[is_sale, "satis_tutari"] = df.loc[is_sale, "tutar_num"]
-    df.loc[is_return, "satis_tutari"] = -df.loc[is_return, "tutar_num"].abs()
-    df.loc[is_adjustment, "satis_tutari"] = df.loc[is_adjustment, "tutar_num"]
-
-    df["tahsilat_tutari"] = 0.0
-    df.loc[is_sale, "tahsilat_tutari"] = df.loc[is_sale, "tahsil_edilen_num"]
-    df.loc[is_collection, "tahsilat_tutari"] = df.loc[is_collection, "tahsil_edilen_num"]
-
-    df["net_bakiye"] = df["satis_tutari"] - df["tahsilat_tutari"]
-    df["tarih_dt"] = parse_date_series(df["tarih"])
-    df["ay"] = df["tarih_dt"].dt.to_period("M").astype(str)
-    return df
-
-
-def active_firma_names() -> List[str]:
-    df = read_firmalar()
-    if df.empty:
-        return []
-    name_col = "firma_adi" if "firma_adi" in df.columns else "cari"
-    if name_col not in df.columns:
-        return []
-    if "durum" in df.columns:
-        df = df[df["durum"].astype(str).str.lower().ne("pasif")]
-    return sorted({clean_str(x) for x in df[name_col].tolist() if clean_str(x)})
-
-
-def active_products() -> pd.DataFrame:
-    df = read_urunler()
-    if df.empty:
-        return pd.DataFrame(columns=["urun_adi", "renk", "varsayilan_fiyat"])
-    if "durum" in df.columns:
-        df = df[df["durum"].astype(str).str.lower().ne("pasif")]
-    for col in ["urun_adi", "renk", "varsayilan_fiyat"]:
+    for col in expected:
         if col not in df.columns:
             df[col] = ""
-    return df
+
+    # Beklenen kolonları öne al, ekstra kolonları sona bırak.
+    extra_cols = [c for c in df.columns if c not in expected]
+    df = df[expected + extra_cols]
+    return clean_empty_rows(df)
 
 
-def cari_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "cari" not in df.columns:
-        return pd.DataFrame(columns=["Cari", "Toplam Satış", "Toplam Tahsilat", "Açık Bakiye"])
-    summary = (
-        df.groupby("cari", dropna=False)
-        .agg(
-            Toplam_Satis=("satis_tutari", "sum"),
-            Toplam_Tahsilat=("tahsilat_tutari", "sum"),
-            Acik_Bakiye=("net_bakiye", "sum"),
-        )
-        .reset_index()
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Google Sheets verileri okunuyor...")
+def load_all_tables(cache_buster: int = 0) -> Tuple[Dict[str, pd.DataFrame], Dict[str, str]]:
+    ss = get_spreadsheet()
+    ranges = [f"'{sheet}'!A1:Z{MAX_ROWS_PER_SHEET}" for sheet in SCHEMA]
+    errors: Dict[str, str] = {}
+    tables: Dict[str, pd.DataFrame] = {name: pd.DataFrame(columns=cols) for name, cols in SCHEMA.items()}
+
+    try:
+        response = run_google_call(ss.values_batch_get, ranges=ranges)
+        value_ranges = response.get("valueRanges", [])
+    except Exception as exc:
+        # Batch tamamen patlarsa ekranı düşürmeyelim.
+        for name in SCHEMA:
+            errors[name] = str(exc)
+        return tables, errors
+
+    for sheet_name, vr in zip(SCHEMA.keys(), value_ranges):
+        try:
+            tables[sheet_name] = dataframe_from_values(sheet_name, vr.get("values", []))
+        except Exception as exc:
+            errors[sheet_name] = str(exc)
+            tables[sheet_name] = pd.DataFrame(columns=SCHEMA[sheet_name])
+    return tables, errors
+
+
+def get_tables() -> Tuple[Dict[str, pd.DataFrame], Dict[str, str]]:
+    return load_all_tables(st.session_state.get("cache_buster", 0))
+
+
+def refresh_data() -> None:
+    st.session_state["cache_buster"] = st.session_state.get("cache_buster", 0) + 1
+    load_all_tables.clear()
+
+
+def get_worksheet(sheet_name: str) -> gspread.Worksheet:
+    ss = get_spreadsheet()
+    return run_google_call(ss.worksheet, sheet_name)
+
+
+def append_rows(sheet_name: str, row_dicts: List[Dict[str, Any]]) -> None:
+    if not row_dicts:
+        return
+    ws = get_worksheet(sheet_name)
+    headers = SCHEMA[sheet_name]
+    rows = [[row.get(col, "") for col in headers] for row in row_dicts]
+    run_google_call(ws.append_rows, rows, value_input_option="USER_ENTERED")
+
+
+def append_row(sheet_name: str, row_dict: Dict[str, Any]) -> None:
+    append_rows(sheet_name, [row_dict])
+
+
+def update_order_payment_status(order_id: str, new_paid_total: float, order_total: float) -> None:
+    tables, _ = get_tables()
+    orders = tables["Siparisler"].copy()
+    if orders.empty or "Siparis_ID" not in orders.columns:
+        return
+    match = orders.index[orders["Siparis_ID"].astype(str) == str(order_id)].tolist()
+    if not match:
+        return
+    df_index = match[0]
+    sheet_row = df_index + 2  # 1. satır header, dataframe index 0 => sheet row 2
+    kalan = max(order_total - new_paid_total, 0)
+    odeme_durumu = "Ödendi" if kalan <= 0.01 else ("Kısmi Ödendi" if new_paid_total > 0 else "Ödenmedi")
+
+    headers = SCHEMA["Siparisler"]
+    c_odenen = col_letter(headers.index("Odenen") + 1)
+    c_kalan = col_letter(headers.index("Kalan") + 1)
+    c_odeme = col_letter(headers.index("Odeme_Durumu") + 1)
+    ws = get_worksheet("Siparisler")
+    run_google_call(
+        ws.update,
+        f"{c_odenen}{sheet_row}:{c_odeme}{sheet_row}",
+        [[round(new_paid_total, 2), round(kalan, 2), odeme_durumu]],
+        value_input_option="USER_ENTERED",
     )
-    summary = summary.rename(columns={"cari": "Cari"})
-    summary = summary.sort_values("Acik_Bakiye", ascending=False)
-    return summary
 
 
-def display_df_money(df: pd.DataFrame, money_cols: Iterable[str]) -> pd.DataFrame:
-    out = df.copy()
-    for col in money_cols:
-        if col in out.columns:
-            out[col] = out[col].apply(money)
+def ensure_sheet_structure() -> Tuple[List[str], List[str]]:
+    """Eksik sekmeleri oluşturur, headerları sabitler. Butonla manuel çalışır."""
+    ss = get_spreadsheet()
+    existing_titles = [ws.title for ws in run_google_call(ss.worksheets)]
+    created: List[str] = []
+    updated: List[str] = []
+
+    for sheet_name, headers in SCHEMA.items():
+        if sheet_name not in existing_titles:
+            ws = run_google_call(ss.add_worksheet, title=sheet_name, rows=MAX_ROWS_PER_SHEET, cols=max(26, len(headers)))
+            created.append(sheet_name)
+        else:
+            ws = run_google_call(ss.worksheet, sheet_name)
+
+        # Headerları her zaman A1'den itibaren net yazıyoruz.
+        end_col = col_letter(len(headers))
+        run_google_call(ws.update, f"A1:{end_col}1", [headers], value_input_option="USER_ENTERED")
+        updated.append(sheet_name)
+
+        if sheet_name == "Listeler":
+            current = run_google_call(ws.get, f"A2:D20")
+            has_any = any(any(str(cell).strip() for cell in row) for row in current)
+            if not has_any:
+                run_google_call(ws.update, "A2:D7", DEFAULT_LIST_ROWS, value_input_option="USER_ENTERED")
+
+    refresh_data()
+    return created, updated
+
+
+# -------------------------------
+# İş mantığı
+# -------------------------------
+
+def active_options(df: pd.DataFrame, id_col: str, name_col: str, durum_col: str = "Durum") -> List[str]:
+    if df.empty or id_col not in df.columns or name_col not in df.columns:
+        return []
+    d = df.copy().fillna("")
+    if durum_col in d.columns:
+        d = d[~d[durum_col].astype(str).str.lower().str.contains("pasif|iptal", na=False)]
+    options = []
+    for _, row in d.iterrows():
+        rid = str(row.get(id_col, "")).strip()
+        name = str(row.get(name_col, "")).strip()
+        if rid and name:
+            options.append(f"{rid} | {name}")
+    return options
+
+
+def parse_option_id(option: str) -> str:
+    return str(option).split(" | ")[0].strip() if option else ""
+
+
+def get_row_by_id(df: pd.DataFrame, id_col: str, id_value: str) -> Optional[pd.Series]:
+    if df.empty or id_col not in df.columns:
+        return None
+    found = df[df[id_col].astype(str) == str(id_value)]
+    if found.empty:
+        return None
+    return found.iloc[0]
+
+
+def orders_with_live_payments(orders: pd.DataFrame, payments: pd.DataFrame) -> pd.DataFrame:
+    if orders.empty:
+        return orders.copy()
+    out = orders.copy().fillna("")
+    out["Genel_Toplam_Num"] = out["Genel_Toplam"].apply(to_float) if "Genel_Toplam" in out.columns else 0.0
+
+    paid_map: Dict[str, float] = {}
+    if not payments.empty and "Siparis_ID" in payments.columns and "Tutar" in payments.columns:
+        temp = payments.copy()
+        temp["Tutar_Num"] = temp["Tutar"].apply(to_float)
+        paid_map = temp.groupby("Siparis_ID")["Tutar_Num"].sum().to_dict()
+
+    out["Odenen_Canli"] = out["Siparis_ID"].map(lambda x: paid_map.get(str(x), 0.0))
+    out["Kalan_Canli"] = out["Genel_Toplam_Num"] - out["Odenen_Canli"]
+    out["Odeme_Durumu_Canli"] = out.apply(
+        lambda r: "Ödendi" if r["Kalan_Canli"] <= 0.01 else ("Kısmi Ödendi" if r["Odenen_Canli"] > 0 else "Ödenmedi"),
+        axis=1,
+    )
     return out
 
 
-# ---------- UI ----------
+# -------------------------------
+# UI
+# -------------------------------
 
-st.set_page_config(
-    page_title="Günday's Cari Takip",
-    page_icon="💼",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
 
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
-    div[data-testid="stMetric"] {background: rgba(128,128,128,0.08); border: 1px solid rgba(128,128,128,0.16); padding: 14px; border-radius: 14px;}
-    .small-muted {color: #777; font-size: 0.9rem;}
+    .block-container {padding-top: 1.2rem; padding-bottom: 3rem;}
+    div[data-testid="stMetric"] {background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); padding: 14px; border-radius: 14px;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.sidebar.title("💼 Günday's Cari")
-page = st.sidebar.radio(
-    "Menü",
-    ["Dashboard", "Satış Girişi", "Tahsilat Girişi", "Cari Detay", "Notlar", "Raporlar", "Yönetim"],
-)
+if "cache_buster" not in st.session_state:
+    st.session_state["cache_buster"] = 0
 
-try:
-    # Bağlantıyı erken test et
-    _ = get_spreadsheet()
-except Exception as exc:
-    st.error("Google Sheet bağlantısı kurulamadı.")
-    st.info("Servis hesabı mailini Sheet'e Düzenleyici olarak eklediğinden ve secrets bilgilerini doğru girdiğinden emin ol.")
-    st.exception(exc)
-    st.stop()
+with st.sidebar:
+    st.title("📦 Gündays Home")
+    st.caption("Sipariş takip sistemi")
+    page = st.radio(
+        "Menü",
+        ["Dashboard", "Yeni Sipariş", "Siparişler", "Firmalar", "Ürünler", "Ödemeler", "Sheet Kurulum"],
+        label_visibility="collapsed",
+    )
+    if st.button("🔄 Verileri yenile", use_container_width=True):
+        refresh_data()
+        st.rerun()
+    st.caption(f"Cache: {CACHE_TTL_SECONDS} sn | Tek batch okuma")
 
-hareketler = read_hareketler()
-firmalar = active_firma_names()
-urunler_df = active_products()
+st.title(APP_TITLE)
+
+tables, errors = get_tables()
+
+if errors:
+    with st.expander("⚠️ Google Sheets okuma uyarıları", expanded=True):
+        st.warning("Bazı sekmeler okunamadı. 429 görüyorsan 1-2 dakika bekleyip Verileri yenile butonuna bas. Bu sürüm eski koddaki sürekli okuma sorununu azaltmak için tek batch okuma kullanır.")
+        for sheet_name, err in errors.items():
+            st.code(f"{sheet_name}: {err}")
+
+firmalar = tables["Firmalar"]
+products = tables["Urunler"]
+orders = tables["Siparisler"]
+lines = tables["Siparis_Kalemleri"]
+payments = tables["Odemeler"]
 
 # ---------- Dashboard ----------
 if page == "Dashboard":
-    st.title("Dashboard")
-    st.caption("Google Sheets verilerinden canlı cari özet.")
+    st.subheader("Genel Durum")
 
-    total_sales = hareketler["satis_tutari"].sum() if not hareketler.empty else 0
-    total_collections = hareketler["tahsilat_tutari"].sum() if not hareketler.empty else 0
-    open_balance = hareketler["net_bakiye"].sum() if not hareketler.empty else 0
-    record_count = len(hareketler)
+    live_orders = orders_with_live_payments(orders, payments)
+    total_revenue = 0.0
+    if not live_orders.empty and "Genel_Toplam_Num" in live_orders.columns:
+        total_revenue = live_orders["Genel_Toplam_Num"].sum()
+    elif not lines.empty and "Satir_Toplami" in lines.columns:
+        total_revenue = lines["Satir_Toplami"].apply(to_float).sum()
+
+    total_paid = payments["Tutar"].apply(to_float).sum() if not payments.empty and "Tutar" in payments.columns else 0.0
+    total_balance = max(total_revenue - total_paid, 0)
+    active_order_count = 0
+    if not orders.empty and "Durum" in orders.columns:
+        active_order_count = len(orders[~orders["Durum"].astype(str).str.lower().str.contains("teslim|iptal", na=False)])
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Toplam Satış", money(total_sales))
-    c2.metric("Toplam Tahsilat", money(total_collections))
-    c3.metric("Açık Cari", money(open_balance))
-    c4.metric("Kayıt Sayısı", f"{record_count}")
+    c1.metric("Toplam Ciro", money(total_revenue))
+    c2.metric("Tahsilat", money(total_paid))
+    c3.metric("Kalan Bakiye", money(total_balance))
+    c4.metric("Aktif Sipariş", active_order_count)
 
     st.divider()
+    left, right = st.columns([1.3, 1])
 
-    left, right = st.columns([1.2, 1])
     with left:
-        st.subheader("Cari Bazlı Bakiye")
-        summary = cari_summary(hareketler)
-        if summary.empty:
-            st.info("Henüz hareket yok.")
+        st.markdown("### Son Siparişler")
+        if live_orders.empty:
+            st.info("Henüz sipariş yok.")
         else:
-            view = display_df_money(summary, ["Toplam_Satis", "Toplam_Tahsilat", "Acik_Bakiye"])
-            st.dataframe(view, use_container_width=True, hide_index=True)
+            show_cols = [c for c in ["Siparis_ID", "Tarih", "Firma_Adi", "Durum", "Genel_Toplam", "Odenen_Canli", "Kalan_Canli", "Odeme_Durumu_Canli"] if c in live_orders.columns]
+            display = live_orders[show_cols].tail(20).iloc[::-1].copy()
+            if "Odenen_Canli" in display.columns:
+                display["Odenen_Canli"] = display["Odenen_Canli"].apply(money)
+            if "Kalan_Canli" in display.columns:
+                display["Kalan_Canli"] = display["Kalan_Canli"].apply(money)
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
     with right:
-        st.subheader("Aylık Satış")
-        if hareketler.empty or "ay" not in hareketler.columns:
-            st.info("Grafik için yeterli veri yok.")
+        st.markdown("### Durum Dağılımı")
+        if not orders.empty and "Durum" in orders.columns:
+            status_counts = orders["Durum"].replace("", "Boş").value_counts().reset_index()
+            status_counts.columns = ["Durum", "Adet"]
+            st.bar_chart(status_counts.set_index("Durum"))
         else:
-            monthly = hareketler.dropna(subset=["tarih_dt"]).groupby("ay", as_index=False)["satis_tutari"].sum()
-            if monthly.empty:
-                st.info("Tarih bilgisi okunamadı.")
-            else:
-                st.bar_chart(monthly, x="ay", y="satis_tutari")
+            st.info("Durum verisi yok.")
 
-    st.subheader("Son Hareketler")
-    if hareketler.empty:
-        st.info("Henüz hareket yok.")
+# ---------- Yeni Sipariş ----------
+elif page == "Yeni Sipariş":
+    st.subheader("Yeni Sipariş Oluştur")
+
+    firma_options = active_options(firmalar, "Firma_ID", "Firma_Adi")
+    product_options = active_options(products, "Urun_ID", "Urun_Adi")
+
+    if not firma_options:
+        st.error("Önce Firmalar sekmesine aktif firma eklemen gerekiyor.")
+    elif not product_options:
+        st.error("Önce Ürünler sekmesine aktif ürün eklemen gerekiyor.")
     else:
-        cols = [c for c in ["tarih", "cari", "islem_tipi", "urun", "renk", "adet", "tutar_num", "tahsil_edilen_num", "net_bakiye", "not"] if c in hareketler.columns]
-        recent = hareketler.sort_values("tarih_dt", ascending=False, na_position="last").head(15)[cols]
-        recent = recent.rename(columns={
-            "tarih": "Tarih",
-            "cari": "Cari",
-            "islem_tipi": "İşlem Tipi",
-            "urun": "Ürün",
-            "renk": "Renk",
-            "adet": "Adet",
-            "tutar_num": "Tutar",
-            "tahsil_edilen_num": "Tahsil Edilen",
-            "net_bakiye": "Net Bakiye",
-            "not": "Not",
-        })
-        recent = display_df_money(recent, ["Tutar", "Tahsil Edilen", "Net Bakiye"])
-        st.dataframe(recent, use_container_width=True, hide_index=True)
+        with st.form("new_order_form", clear_on_submit=False):
+            c1, c2, c3 = st.columns(3)
+            sip_tarih = c1.date_input("Sipariş Tarihi", value=date.today())
+            selected_firma = c2.selectbox("Firma", firma_options)
+            durum = c3.selectbox("Durum", ["Hazırlanıyor", "Onaylandı", "Üretimde", "Sevke Hazır", "Teslim Edildi", "İptal"])
 
-# ---------- Satış Girişi ----------
-elif page == "Satış Girişi":
-    st.title("Satış Girişi")
-    st.caption("Yeni satış kaydı Google Sheets > CARI_HAREKETLER sayfasına işlenir.")
+            c4, c5 = st.columns([1, 2])
+            teslim_tarihi = c4.date_input("Teslim Tarihi", value=date.today())
+            sevk_adresi = c5.text_input("Sevk Adresi")
+            note = st.text_area("Sipariş Notu", height=80)
 
-    with st.form("sales_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            tarih = st.date_input("Tarih", value=date.today(), format="DD.MM.YYYY")
-            cari = st.selectbox("Cari / Firma", options=firmalar + ["+ Yeni cari yaz"], index=0 if firmalar else None)
-            if cari == "+ Yeni cari yaz" or not firmalar:
-                cari = st.text_input("Yeni Cari / Firma Adı")
-        with c2:
-            product_options = []
-            if not urunler_df.empty:
-                for _, row in urunler_df.iterrows():
-                    label = clean_str(row.get("urun_adi", ""))
-                    renk = clean_str(row.get("renk", ""))
-                    if renk:
-                        label = f"{label} - {renk}"
-                    if label:
-                        product_options.append(label)
-            product_options = sorted(set(product_options))
-            urun_secim = st.selectbox("Ürün", options=product_options + ["+ Yeni ürün yaz"], index=0 if product_options else None)
-            if urun_secim == "+ Yeni ürün yaz" or not product_options:
-                urun = st.text_input("Yeni Ürün Adı")
-                renk = st.text_input("Renk")
-                default_price = 0.0
-            else:
-                parts = urun_secim.split(" - ")
-                urun = parts[0]
-                renk = parts[1] if len(parts) > 1 else ""
-                matching = urunler_df[
-                    (urunler_df["urun_adi"].astype(str).str.strip() == urun)
-                    & (urunler_df["renk"].astype(str).str.strip() == renk)
-                ]
-                default_price = to_float(matching.iloc[0].get("varsayilan_fiyat", 0)) if not matching.empty else 0.0
-        with c3:
-            adet = st.number_input("Adet", min_value=1, step=1, value=1)
-            birim_fiyat = st.number_input("Birim Fiyat", min_value=0.0, step=100.0, value=float(default_price))
-            tutar = adet * birim_fiyat
-            st.metric("Tutar", money(tutar))
+            line_count = st.number_input("Sipariş kalem sayısı", min_value=1, max_value=20, value=1, step=1)
+            kalem_rows = []
+            st.markdown("#### Ürün Kalemleri")
+            for i in range(int(line_count)):
+                cols = st.columns([2.4, 0.8, 1, 0.8, 1.2])
+                selected_product = cols[0].selectbox(f"Ürün {i+1}", product_options, key=f"prod_{i}")
+                product_id = parse_option_id(selected_product)
+                prod_row = get_row_by_id(products, "Urun_ID", product_id)
+                default_price = to_float(prod_row.get("Birim_Fiyat", 0)) if prod_row is not None else 0.0
+                default_kdv = to_float(prod_row.get("KDV_Orani", 20)) if prod_row is not None else 20.0
 
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            odeme_turu = st.selectbox("Ödeme Türü", options=get_ayar_list("Odeme_Turu"))
-        with c5:
-            tahsil_edilen = st.number_input("Tahsil Edilen", min_value=0.0, step=100.0, value=0.0)
-            kalan = tutar - tahsil_edilen
-            st.metric("Kalan", money(kalan))
-        with c6:
-            odeme_tarihi = st.date_input("Ödeme / Vade Tarihi", value=date.today(), format="DD.MM.YYYY")
+                qty = cols[1].number_input("Miktar", min_value=0.0, value=1.0, step=1.0, key=f"qty_{i}")
+                price = cols[2].number_input("Birim Fiyat", min_value=0.0, value=float(default_price), step=100.0, key=f"price_{i}")
+                kdv = cols[3].number_input("KDV %", min_value=0.0, max_value=100.0, value=float(default_kdv), step=1.0, key=f"kdv_{i}")
+                line_note = cols[4].text_input("Not", key=f"line_note_{i}")
 
-        not_text = st.text_area("İşlem Notu", placeholder="Örn: 3 adet sevk edildi, kalan ödeme cuma alınacak...")
-        ek_not = st.text_input("Ek Not / Kısa Etiket", placeholder="Örn: acil, vade, sevkiyat")
-        kullanici = st.text_input("Kullanıcı", value="Talha")
-        submitted = st.form_submit_button("Satışı Kaydet", type="primary")
+                product_name = str(prod_row.get("Urun_Adi", "")) if prod_row is not None else ""
+                ara = qty * price
+                kdv_tutari = ara * (kdv / 100)
+                toplam = ara + kdv_tutari
+                kalem_rows.append({
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "qty": qty,
+                    "price": price,
+                    "kdv": kdv,
+                    "ara": ara,
+                    "kdv_tutari": kdv_tutari,
+                    "toplam": toplam,
+                    "note": line_note,
+                })
 
-    if submitted:
-        if not clean_str(cari):
-            st.error("Cari / Firma adı boş olamaz.")
-        elif not clean_str(urun):
-            st.error("Ürün adı boş olamaz.")
-        elif tutar <= 0:
-            st.error("Tutar 0 olamaz. Adet ve fiyatı kontrol et.")
-        else:
-            append_record(
-                WORKSHEETS["hareketler"],
-                HAREKET_COLUMNS,
-                {
-                    "ID": new_id("SAT"),
-                    "Tarih": tarih.strftime("%d.%m.%Y"),
-                    "Cari": cari,
-                    "Islem_Tipi": "Satış",
-                    "Urun": urun,
-                    "Renk": renk,
-                    "Adet": adet,
-                    "Birim_Fiyat": birim_fiyat,
-                    "Tutar": tutar,
-                    "Odeme_Turu": odeme_turu,
-                    "Tahsil_Edilen": tahsil_edilen,
-                    "Kalan": kalan,
-                    "Odeme_Tarihi": odeme_tarihi.strftime("%d.%m.%Y"),
-                    "Not": not_text,
-                    "Ek_Not": ek_not,
-                    "Kayit_Zamani": now_str(),
-                    "Kullanici": kullanici,
-                },
-            )
-            st.success(f"Satış kaydedildi: {cari} / {money(tutar)}")
-            st.rerun()
+            ara_toplam = sum(x["ara"] for x in kalem_rows)
+            kdv_toplam = sum(x["kdv_tutari"] for x in kalem_rows)
+            genel_toplam = sum(x["toplam"] for x in kalem_rows)
 
-# ---------- Tahsilat Girişi ----------
-elif page == "Tahsilat Girişi":
-    st.title("Tahsilat Girişi")
-    st.caption("Cari ödeme/tahsilat hareketi ekle.")
+            st.info(f"Ara Toplam: {money(ara_toplam)} | KDV: {money(kdv_toplam)} | Genel Toplam: {money(genel_toplam)}")
+            submitted = st.form_submit_button("✅ Siparişi Kaydet", use_container_width=True)
 
-    summary = cari_summary(hareketler)
-    with st.form("collection_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            cari = st.selectbox("Cari / Firma", options=firmalar + ["+ Yeni cari yaz"], index=0 if firmalar else None)
-            if cari == "+ Yeni cari yaz" or not firmalar:
-                cari = st.text_input("Yeni Cari / Firma Adı")
-        with c2:
-            tarih = st.date_input("Tahsilat Tarihi", value=date.today(), format="DD.MM.YYYY")
-            odeme_turu = st.selectbox("Ödeme Türü", options=[x for x in get_ayar_list("Odeme_Turu") if x != "Açık Cari"] or get_ayar_list("Odeme_Turu"))
-        with c3:
-            current_balance = 0.0
-            if not summary.empty and clean_str(cari):
-                row = summary[summary["Cari"].astype(str).str.strip() == clean_str(cari)]
-                if not row.empty:
-                    current_balance = float(row.iloc[0]["Acik_Bakiye"])
-            st.metric("Mevcut Açık Bakiye", money(current_balance))
-            tahsil_edilen = st.number_input("Tahsilat Tutarı", min_value=0.0, step=100.0, value=0.0)
-            st.metric("İşlem Sonrası Tahmini Bakiye", money(current_balance - tahsil_edilen))
-
-        not_text = st.text_area("Tahsilat Notu", placeholder="Örn: Nakit alındı, dekont bekleniyor...")
-        kullanici = st.text_input("Kullanıcı", value="Talha")
-        submitted = st.form_submit_button("Tahsilatı Kaydet", type="primary")
-
-    if submitted:
-        if not clean_str(cari):
-            st.error("Cari / Firma adı boş olamaz.")
-        elif tahsil_edilen <= 0:
-            st.error("Tahsilat tutarı 0 olamaz.")
-        else:
-            append_record(
-                WORKSHEETS["hareketler"],
-                HAREKET_COLUMNS,
-                {
-                    "ID": new_id("TAH"),
-                    "Tarih": tarih.strftime("%d.%m.%Y"),
-                    "Cari": cari,
-                    "Islem_Tipi": "Tahsilat",
-                    "Urun": "",
-                    "Renk": "",
-                    "Adet": "",
-                    "Birim_Fiyat": "",
-                    "Tutar": 0,
-                    "Odeme_Turu": odeme_turu,
-                    "Tahsil_Edilen": tahsil_edilen,
-                    "Kalan": -tahsil_edilen,
-                    "Odeme_Tarihi": tarih.strftime("%d.%m.%Y"),
-                    "Not": not_text,
-                    "Ek_Not": "Tahsilat",
-                    "Kayit_Zamani": now_str(),
-                    "Kullanici": kullanici,
-                },
-            )
-            st.success(f"Tahsilat kaydedildi: {cari} / {money(tahsil_edilen)}")
-            st.rerun()
-
-# ---------- Cari Detay ----------
-elif page == "Cari Detay":
-    st.title("Cari Detay")
-    if not firmalar:
-        st.warning("Firma listesi boş görünüyor. Yönetim ekranından firma ekleyebilirsin.")
-        st.stop()
-
-    cari = st.selectbox("Cari Seç", options=firmalar)
-    df = hareketler[hareketler["cari"].astype(str).str.strip() == clean_str(cari)] if not hareketler.empty else pd.DataFrame()
-
-    total_sales = df["satis_tutari"].sum() if not df.empty else 0
-    total_collections = df["tahsilat_tutari"].sum() if not df.empty else 0
-    open_balance = df["net_bakiye"].sum() if not df.empty else 0
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Toplam Satış", money(total_sales))
-    c2.metric("Toplam Tahsilat", money(total_collections))
-    c3.metric("Açık Bakiye", money(open_balance))
-
-    st.subheader("Hareket Dökümü")
-    if df.empty:
-        st.info("Bu cariye ait hareket yok.")
-    else:
-        cols = [c for c in ["tarih", "islem_tipi", "urun", "renk", "adet", "tutar_num", "tahsil_edilen_num", "net_bakiye", "odeme_turu", "not"] if c in df.columns]
-        view = df.sort_values("tarih_dt", ascending=False, na_position="last")[cols]
-        view = view.rename(columns={
-            "tarih": "Tarih",
-            "islem_tipi": "İşlem Tipi",
-            "urun": "Ürün",
-            "renk": "Renk",
-            "adet": "Adet",
-            "tutar_num": "Tutar",
-            "tahsil_edilen_num": "Tahsil Edilen",
-            "net_bakiye": "Net Bakiye",
-            "odeme_turu": "Ödeme Türü",
-            "not": "Not",
-        })
-        view = display_df_money(view, ["Tutar", "Tahsil Edilen", "Net Bakiye"])
-        st.dataframe(view, use_container_width=True, hide_index=True)
-
-    st.subheader("Cari Notları")
-    notes = read_notlar()
-    if notes.empty or "cari" not in notes.columns:
-        st.info("Bu cariye ait not yok.")
-    else:
-        notes = notes[notes["cari"].astype(str).str.strip() == clean_str(cari)]
-        if notes.empty:
-            st.info("Bu cariye ait not yok.")
-        else:
-            show_cols = [c for c in ["tarih", "not_tipi", "not_detayi", "hatirlatma_tarihi", "durum", "kullanici"] if c in notes.columns]
-            st.dataframe(notes[show_cols].tail(20), use_container_width=True, hide_index=True)
-
-# ---------- Notlar ----------
-elif page == "Notlar":
-    st.title("Notlar & Hatırlatmalar")
-    st.caption("Cari bazlı not, problem, vade ve sevkiyat hatırlatmaları.")
-
-    with st.form("note_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            tarih = st.date_input("Not Tarihi", value=date.today(), format="DD.MM.YYYY")
-            cari = st.selectbox("Cari / Firma", options=firmalar + ["+ Yeni cari yaz"], index=0 if firmalar else None)
-            if cari == "+ Yeni cari yaz" or not firmalar:
-                cari = st.text_input("Yeni Cari / Firma Adı")
-        with c2:
-            not_tipi = st.selectbox("Not Tipi", options=get_ayar_list("Not_Tipi"))
-            hatirlatma_tarihi = st.date_input("Hatırlatma Tarihi", value=date.today(), format="DD.MM.YYYY")
-        with c3:
-            durum = st.selectbox("Durum", options=get_ayar_list("Durum"))
-            kullanici = st.text_input("Kullanıcı", value="Talha")
-
-        not_detayi = st.text_area("Not Detayı", placeholder="Örn: Cuma günü ödeme için aranacak...")
-        submitted = st.form_submit_button("Notu Kaydet", type="primary")
-
-    if submitted:
-        if not clean_str(cari):
-            st.error("Cari / Firma adı boş olamaz.")
-        elif not clean_str(not_detayi):
-            st.error("Not detayı boş olamaz.")
-        else:
-            append_record(
-                WORKSHEETS["notlar"],
-                NOT_COLUMNS,
-                {
-                    "ID": new_id("NOT"),
-                    "Tarih": tarih.strftime("%d.%m.%Y"),
-                    "Cari": cari,
-                    "Not_Tipi": not_tipi,
-                    "Not_Detayi": not_detayi,
-                    "Hatirlatma_Tarihi": hatirlatma_tarihi.strftime("%d.%m.%Y"),
-                    "Durum": durum,
-                    "Kullanici": kullanici,
-                    "Kayit_Zamani": now_str(),
-                },
-            )
-            st.success("Not kaydedildi.")
-            st.rerun()
-
-    st.subheader("Açık Notlar")
-    notes = read_notlar()
-    if notes.empty:
-        st.info("Henüz not yok.")
-    else:
-        if "durum" in notes.columns:
-            notes = notes[notes["durum"].astype(str).str.lower().ne("tamamlandı")]
-        show_cols = [c for c in ["tarih", "cari", "not_tipi", "not_detayi", "hatirlatma_tarihi", "durum", "kullanici"] if c in notes.columns]
-        st.dataframe(notes[show_cols], use_container_width=True, hide_index=True)
-
-# ---------- Raporlar ----------
-elif page == "Raporlar":
-    st.title("Raporlar")
-    st.caption("Tarih, cari ve ürün bazlı filtreleme.")
-
-    if hareketler.empty:
-        st.info("Henüz raporlanacak hareket yok.")
-        st.stop()
-
-    min_date = hareketler["tarih_dt"].min()
-    max_date = hareketler["tarih_dt"].max()
-    default_start = min_date.date() if pd.notna(min_date) else date.today()
-    default_end = max_date.date() if pd.notna(max_date) else date.today()
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        start_date = st.date_input("Başlangıç", value=default_start, format="DD.MM.YYYY")
-    with c2:
-        end_date = st.date_input("Bitiş", value=default_end, format="DD.MM.YYYY")
-    with c3:
-        selected_cari = st.multiselect("Cari", options=firmalar)
-
-    products = sorted({clean_str(x) for x in hareketler.get("urun", pd.Series(dtype=str)).tolist() if clean_str(x)})
-    selected_products = st.multiselect("Ürün", options=products)
-
-    filtered = hareketler.copy()
-    if "tarih_dt" in filtered.columns:
-        filtered = filtered[(filtered["tarih_dt"].dt.date >= start_date) & (filtered["tarih_dt"].dt.date <= end_date)]
-    if selected_cari:
-        filtered = filtered[filtered["cari"].isin(selected_cari)]
-    if selected_products:
-        filtered = filtered[filtered["urun"].isin(selected_products)]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Filtreli Satış", money(filtered["satis_tutari"].sum()))
-    c2.metric("Filtreli Tahsilat", money(filtered["tahsilat_tutari"].sum()))
-    c3.metric("Filtreli Bakiye", money(filtered["net_bakiye"].sum()))
-
-    show_cols = [c for c in ["tarih", "cari", "islem_tipi", "urun", "renk", "adet", "tutar_num", "tahsil_edilen_num", "net_bakiye", "odeme_turu", "not"] if c in filtered.columns]
-    report = filtered[show_cols].rename(columns={
-        "tarih": "Tarih",
-        "cari": "Cari",
-        "islem_tipi": "İşlem Tipi",
-        "urun": "Ürün",
-        "renk": "Renk",
-        "adet": "Adet",
-        "tutar_num": "Tutar",
-        "tahsil_edilen_num": "Tahsil Edilen",
-        "net_bakiye": "Net Bakiye",
-        "odeme_turu": "Ödeme Türü",
-        "not": "Not",
-    })
-    st.dataframe(display_df_money(report, ["Tutar", "Tahsil Edilen", "Net Bakiye"]), use_container_width=True, hide_index=True)
-
-    csv = report.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("CSV İndir", data=csv, file_name="gundays_cari_rapor.csv", mime="text/csv")
-
-# ---------- Yönetim ----------
-elif page == "Yönetim":
-    st.title("Yönetim")
-    tab1, tab2 = st.tabs(["Firma Ekle", "Ürün Ekle"])
-
-    with tab1:
-        st.subheader("Yeni Firma / Cari")
-        with st.form("firma_form"):
-            c1, c2 = st.columns(2)
-            with c1:
-                firma_adi = st.text_input("Firma Adı")
-                tip = st.text_input("Tip", placeholder="AVM, Pazaryeri, Şube...")
-                telefon = st.text_input("Telefon")
-            with c2:
-                adres = st.text_area("Adres")
-                vergi_no = st.text_input("Vergi No")
-                vergi_dairesi = st.text_input("Vergi Dairesi")
-            not_text = st.text_area("Not")
-            submitted = st.form_submit_button("Firmayı Kaydet", type="primary")
         if submitted:
-            if not clean_str(firma_adi):
-                st.error("Firma adı boş olamaz.")
+            valid_lines = [x for x in kalem_rows if x["product_id"] and x["qty"] > 0]
+            firma_id = parse_option_id(selected_firma)
+            firma_row = get_row_by_id(firmalar, "Firma_ID", firma_id)
+            firma_name = str(firma_row.get("Firma_Adi", "")) if firma_row is not None else ""
+
+            if not valid_lines:
+                st.error("En az 1 ürün kalemi girmelisin.")
             else:
-                append_record(
-                    WORKSHEETS["firmalar"],
-                    FIRMA_COLUMNS,
-                    {
-                        "Firma_ID": new_id("FIR"),
-                        "Firma_Adi": firma_adi,
-                        "Tip": tip,
-                        "Telefon": telefon,
-                        "Adres": adres,
-                        "Vergi_No": vergi_no,
-                        "Vergi_Dairesi": vergi_dairesi,
-                        "Durum": "Aktif",
-                        "Not": not_text,
-                    },
-                )
-                st.success("Firma kaydedildi.")
-                st.rerun()
+                try:
+                    siparis_id = next_id(orders, "Siparis_ID", "SIP")
+                    order_row = {
+                        "Siparis_ID": siparis_id,
+                        "Tarih": date_text(sip_tarih),
+                        "Firma_ID": firma_id,
+                        "Firma_Adi": firma_name,
+                        "Durum": durum,
+                        "Teslim_Tarihi": date_text(teslim_tarihi),
+                        "Sevk_Adresi": sevk_adresi,
+                        "Ara_Toplam": round(ara_toplam, 2),
+                        "KDV_Tutari": round(kdv_toplam, 2),
+                        "Genel_Toplam": round(genel_toplam, 2),
+                        "Odenen": 0,
+                        "Kalan": round(genel_toplam, 2),
+                        "Odeme_Durumu": "Ödenmedi",
+                        "Not": note,
+                        "Olusturma_Tarihi": now_text(),
+                    }
+                    line_rows = []
+                    next_line_num_base = next_id(lines, "Kalem_ID", "KLM")
+                    base_num = int(re.findall(r"\d+", next_line_num_base)[-1])
+                    for offset, item in enumerate(valid_lines):
+                        line_rows.append({
+                            "Kalem_ID": f"KLM-{base_num + offset:05d}",
+                            "Siparis_ID": siparis_id,
+                            "Urun_ID": item["product_id"],
+                            "Urun_Adi": item["product_name"],
+                            "Miktar": item["qty"],
+                            "Birim_Fiyat": round(item["price"], 2),
+                            "KDV_Orani": item["kdv"],
+                            "Ara_Toplam": round(item["ara"], 2),
+                            "KDV_Tutari": round(item["kdv_tutari"], 2),
+                            "Satir_Toplami": round(item["toplam"], 2),
+                            "Not": item["note"],
+                        })
+                    append_row("Siparisler", order_row)
+                    append_rows("Siparis_Kalemleri", line_rows)
+                    append_row("Kullanim", {"Tarih": now_text(), "Islem": "Sipariş oluşturuldu", "Kullanici": "Streamlit", "Detay": siparis_id})
+                    refresh_data()
+                    st.success(f"Sipariş kaydedildi: {siparis_id}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Sipariş kaydedilemedi: {exc}")
 
-        st.subheader("Firma Listesi")
-        fdf = read_firmalar()
-        if fdf.empty:
-            st.info("Firma listesi boş.")
-        else:
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
+# ---------- Siparişler ----------
+elif page == "Siparişler":
+    st.subheader("Sipariş Listesi")
+    live_orders = orders_with_live_payments(orders, payments)
 
-    with tab2:
-        st.subheader("Yeni Ürün")
+    if live_orders.empty:
+        st.info("Henüz sipariş yok.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        search = c1.text_input("Firma / Sipariş Ara")
+        status = c2.selectbox("Durum", ["Tümü"] + sorted([x for x in live_orders["Durum"].dropna().astype(str).unique() if x]))
+        pay_status = c3.selectbox("Ödeme", ["Tümü", "Ödenmedi", "Kısmi Ödendi", "Ödendi"])
+
+        df = live_orders.copy()
+        if search:
+            s = search.lower()
+            df = df[df.apply(lambda r: s in " ".join([str(r.get("Siparis_ID", "")), str(r.get("Firma_Adi", ""))]).lower(), axis=1)]
+        if status != "Tümü":
+            df = df[df["Durum"].astype(str) == status]
+        if pay_status != "Tümü":
+            df = df[df["Odeme_Durumu_Canli"].astype(str) == pay_status]
+
+        display = df.copy()
+        for col in ["Genel_Toplam_Num", "Odenen_Canli", "Kalan_Canli"]:
+            if col in display.columns:
+                display[col] = display[col].apply(money)
+        show_cols = [c for c in ["Siparis_ID", "Tarih", "Firma_Adi", "Durum", "Genel_Toplam_Num", "Odenen_Canli", "Kalan_Canli", "Odeme_Durumu_Canli", "Not"] if c in display.columns]
+        st.dataframe(display[show_cols].iloc[::-1], use_container_width=True, hide_index=True)
+
+        st.markdown("### Sipariş Detayı")
+        selected_order = st.selectbox("Sipariş seç", df["Siparis_ID"].astype(str).tolist() if not df.empty else [])
+        if selected_order:
+            detail_lines = lines[lines["Siparis_ID"].astype(str) == selected_order].copy() if not lines.empty else pd.DataFrame()
+            detail_payments = payments[payments["Siparis_ID"].astype(str) == selected_order].copy() if not payments.empty else pd.DataFrame()
+            st.markdown("#### Kalemler")
+            st.dataframe(detail_lines, use_container_width=True, hide_index=True)
+            st.markdown("#### Ödemeler")
+            st.dataframe(detail_payments, use_container_width=True, hide_index=True)
+
+# ---------- Firmalar ----------
+elif page == "Firmalar":
+    st.subheader("Firmalar")
+    with st.expander("➕ Yeni firma ekle", expanded=False):
+        with st.form("firma_form"):
+            c1, c2, c3 = st.columns(3)
+            firma_adi = c1.text_input("Firma Adı *")
+            yetkili = c2.text_input("Yetkili")
+            telefon = c3.text_input("Telefon")
+            c4, c5, c6 = st.columns(3)
+            email = c4.text_input("Email")
+            il = c5.text_input("İl")
+            ilce = c6.text_input("İlçe")
+            adres = st.text_area("Adres")
+            c7, c8, c9 = st.columns(3)
+            vergi_dairesi = c7.text_input("Vergi Dairesi")
+            vkn = c8.text_input("VKN/TCKN")
+            durum = c9.selectbox("Durum", ["Aktif", "Pasif"])
+            note = st.text_area("Not", key="firma_note")
+            if st.form_submit_button("Firmayı kaydet", use_container_width=True):
+                if not firma_adi.strip():
+                    st.error("Firma adı zorunlu.")
+                else:
+                    try:
+                        firma_id = next_id(firmalar, "Firma_ID", "F")
+                        append_row("Firmalar", {
+                            "Firma_ID": firma_id,
+                            "Firma_Adi": firma_adi,
+                            "Yetkili": yetkili,
+                            "Telefon": telefon,
+                            "Email": email,
+                            "Adres": adres,
+                            "Il": il,
+                            "Ilce": ilce,
+                            "Vergi_Dairesi": vergi_dairesi,
+                            "VKN_TCKN": vkn,
+                            "Durum": durum,
+                            "Kayit_Tarihi": now_text(),
+                            "Not": note,
+                        })
+                        append_row("Kullanim", {"Tarih": now_text(), "Islem": "Firma eklendi", "Kullanici": "Streamlit", "Detay": firma_id})
+                        refresh_data()
+                        st.success(f"Firma eklendi: {firma_id}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Firma eklenemedi: {exc}")
+    st.dataframe(firmalar.iloc[::-1] if not firmalar.empty else firmalar, use_container_width=True, hide_index=True)
+
+# ---------- Ürünler ----------
+elif page == "Ürünler":
+    st.subheader("Ürünler")
+    with st.expander("➕ Yeni ürün ekle", expanded=False):
         with st.form("urun_form"):
             c1, c2, c3 = st.columns(3)
-            with c1:
-                urun_adi = st.text_input("Ürün Adı")
-            with c2:
-                renk = st.text_input("Renk")
-            with c3:
-                varsayilan_fiyat = st.number_input("Varsayılan Fiyat", min_value=0.0, step=100.0, value=0.0)
-            not_text = st.text_area("Not")
-            submitted = st.form_submit_button("Ürünü Kaydet", type="primary")
-        if submitted:
-            if not clean_str(urun_adi):
-                st.error("Ürün adı boş olamaz.")
-            else:
-                append_record(
-                    WORKSHEETS["urunler"],
-                    URUN_COLUMNS,
-                    {
-                        "Urun_ID": new_id("URN"),
-                        "Urun_Adi": urun_adi,
-                        "Renk": renk,
-                        "Varsayilan_Fiyat": varsayilan_fiyat,
-                        "Durum": "Aktif",
-                        "Not": not_text,
-                    },
-                )
-                st.success("Ürün kaydedildi.")
-                st.rerun()
+            urun_adi = c1.text_input("Ürün Adı *")
+            kategori = c2.text_input("Kategori", value="Dilsiz Uşak")
+            renk = c3.text_input("Renk")
+            c4, c5, c6, c7 = st.columns(4)
+            birim = c4.selectbox("Birim", ["Adet", "Takım", "Paket", "Koli", "Metre", "Kg"])
+            fiyat = c5.number_input("Birim Fiyat", min_value=0.0, value=0.0, step=100.0)
+            kdv = c6.number_input("KDV %", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
+            durum = c7.selectbox("Durum", ["Aktif", "Pasif"])
+            stok = st.text_input("Stok Kodu")
+            note = st.text_area("Not", key="urun_note")
+            if st.form_submit_button("Ürünü kaydet", use_container_width=True):
+                if not urun_adi.strip():
+                    st.error("Ürün adı zorunlu.")
+                else:
+                    try:
+                        urun_id = next_id(products, "Urun_ID", "U")
+                        append_row("Urunler", {
+                            "Urun_ID": urun_id,
+                            "Urun_Adi": urun_adi,
+                            "Kategori": kategori,
+                            "Renk": renk,
+                            "Birim": birim,
+                            "Birim_Fiyat": round(fiyat, 2),
+                            "KDV_Orani": kdv,
+                            "Durum": durum,
+                            "Stok_Kodu": stok,
+                            "Not": note,
+                        })
+                        append_row("Kullanim", {"Tarih": now_text(), "Islem": "Ürün eklendi", "Kullanici": "Streamlit", "Detay": urun_id})
+                        refresh_data()
+                        st.success(f"Ürün eklendi: {urun_id}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Ürün eklenemedi: {exc}")
+    st.dataframe(products.iloc[::-1] if not products.empty else products, use_container_width=True, hide_index=True)
 
-        st.subheader("Ürün Listesi")
-        udf = read_urunler()
-        if udf.empty:
-            st.info("Ürün listesi boş.")
-        else:
-            st.dataframe(udf, use_container_width=True, hide_index=True)
+# ---------- Ödemeler ----------
+elif page == "Ödemeler":
+    st.subheader("Ödemeler")
+    live_orders = orders_with_live_payments(orders, payments)
+    if live_orders.empty:
+        st.info("Ödeme girmek için önce sipariş oluşturmalısın.")
+    else:
+        open_df = live_orders[live_orders["Kalan_Canli"] > 0.01].copy()
+        if open_df.empty:
+            open_df = live_orders.copy()
+        open_df["Option"] = open_df.apply(lambda r: f"{r['Siparis_ID']} | {r['Firma_Adi']} | Kalan: {money(r['Kalan_Canli'])}", axis=1)
+        with st.form("payment_form"):
+            c1, c2, c3 = st.columns(3)
+            odeme_tarihi = c1.date_input("Ödeme Tarihi", value=date.today())
+            selected_order = c2.selectbox("Sipariş", open_df["Option"].tolist())
+            odeme_tipi = c3.selectbox("Ödeme Tipi", ["Nakit", "Havale/EFT", "Kredi Kartı", "Çek/Senet", "Diğer"])
+            tutar = st.number_input("Tutar", min_value=0.0, value=0.0, step=100.0)
+            aciklama = st.text_area("Açıklama")
+            if st.form_submit_button("Ödemeyi Kaydet", use_container_width=True):
+                if tutar <= 0:
+                    st.error("Tutar 0'dan büyük olmalı.")
+                else:
+                    try:
+                        siparis_id = parse_option_id(selected_order)
+                        order_row = get_row_by_id(live_orders, "Siparis_ID", siparis_id)
+                        firma_id = str(order_row.get("Firma_ID", "")) if order_row is not None else ""
+                        firma_name = str(order_row.get("Firma_Adi", "")) if order_row is not None else ""
+                        order_total = to_float(order_row.get("Genel_Toplam", 0)) if order_row is not None else 0.0
+                        current_paid = to_float(order_row.get("Odenen_Canli", 0)) if order_row is not None else 0.0
+                        new_paid_total = current_paid + tutar
+                        odeme_id = next_id(payments, "Odeme_ID", "ODE")
+                        append_row("Odemeler", {
+                            "Odeme_ID": odeme_id,
+                            "Tarih": date_text(odeme_tarihi),
+                            "Siparis_ID": siparis_id,
+                            "Firma_ID": firma_id,
+                            "Firma_Adi": firma_name,
+                            "Odeme_Tipi": odeme_tipi,
+                            "Tutar": round(tutar, 2),
+                            "Aciklama": aciklama,
+                        })
+                        update_order_payment_status(siparis_id, new_paid_total, order_total)
+                        append_row("Kullanim", {"Tarih": now_text(), "Islem": "Ödeme eklendi", "Kullanici": "Streamlit", "Detay": f"{odeme_id} / {siparis_id}"})
+                        refresh_data()
+                        st.success(f"Ödeme kaydedildi: {odeme_id}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Ödeme kaydedilemedi: {exc}")
+        st.dataframe(payments.iloc[::-1] if not payments.empty else payments, use_container_width=True, hide_index=True)
+
+# ---------- Sheet Kurulum ----------
+elif page == "Sheet Kurulum":
+    st.subheader("Google Sheets Kurulum ve Kontrol")
+    st.markdown(
+        """
+        Bu sayfa sistemi sıfırdan sabitlemek için var. Eski otomatik başlık arama mantığı kaldırıldı.
+        Kod artık aşağıdaki sabit sekme ve kolon şemasına göre çalışıyor.
+        """
+    )
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("🧱 Sheet yapısını oluştur / onar", type="primary", use_container_width=True):
+            try:
+                created, updated = ensure_sheet_structure()
+                st.success("Sheet yapısı hazırlandı.")
+                if created:
+                    st.write("Oluşturulan sekmeler:", ", ".join(created))
+                st.write("Güncellenen sekmeler:", ", ".join(updated))
+            except Exception as exc:
+                st.error(f"Sheet yapısı hazırlanamadı: {exc}")
+    with c2:
+        st.info("Bu işlem sekmelerin 1. satırına doğru başlıkları yazar. Alt satırlardaki kayıtları silmez. Yine de büyük değişiklikten önce Google Sheet'in bir kopyasını almak mantıklı.")
+
+    st.markdown("### Beklenen sekme ve kolonlar")
+    for sheet_name, headers in SCHEMA.items():
+        with st.expander(sheet_name, expanded=False):
+            st.code(" | ".join(headers))
+
+    st.markdown("### Mevcut veri sayıları")
+    counts = []
+    for sheet_name, df in tables.items():
+        counts.append({"Sekme": sheet_name, "Satır Sayısı": len(df), "Kolon Sayısı": len(df.columns)})
+    st.dataframe(pd.DataFrame(counts), use_container_width=True, hide_index=True)
