@@ -13,19 +13,20 @@ from google.oauth2.service_account import Credentials
 
 # =====================================================
 # GÜNDAYS HOME - SİPARİŞ TAKİP SİSTEMİ
-# Tek dosya Streamlit uygulaması.
-# Google Sheets okuma mantığı: tek batch read + cache.
+# V4: Sıfırdan, tek dosya, eksik sekme toleranslı.
+# - src / gsheets_db import yok.
+# - Mevcut sekmeleri normalize ederek bulur: Siparisler / Siparişler vb.
+# - Eksik sekme varsa batch-read'e dahil etmez, bu yüzden "Unable to parse range" hatası patlatmaz.
+# - Sheet kurulumunda mevcut sekmeye tekrar addSheet atmaz; gerekirse başlığı canonical isme çevirir.
 # =====================================================
 
-DEFAULT_SPREADSHEET_ID = "1nOIO-sodcXTx1v-dp1Do9Zj-mev6O5rbYkyT204m-Vk"
 APP_TITLE = "Gündays Home Sipariş Takip"
-CACHE_TTL_SECONDS = 120
+DEFAULT_SPREADSHEET_ID = "1nOIO-sodcXTx1v-dp1Do9Zj-mev6O5rbYkyT204m-Vk"
+CACHE_TTL_SECONDS = 300
 MAX_ROWS_PER_SHEET = 10000
 
 SCHEMA: Dict[str, List[str]] = {
-    "Dashboard": [
-        "Metrik", "Deger", "Aciklama"
-    ],
+    "Dashboard": ["Metrik", "Deger", "Aciklama"],
     "Firmalar": [
         "Firma_ID", "Firma_Adi", "Yetkili", "Telefon", "Email", "Adres", "Il", "Ilce",
         "Vergi_Dairesi", "VKN_TCKN", "Durum", "Kayit_Tarihi", "Not"
@@ -46,15 +47,9 @@ SCHEMA: Dict[str, List[str]] = {
     "Odemeler": [
         "Odeme_ID", "Tarih", "Siparis_ID", "Firma_ID", "Firma_Adi", "Odeme_Tipi", "Tutar", "Aciklama"
     ],
-    "Listeler": [
-        "Durum_Tipleri", "Odeme_Tipleri", "Urun_Kategorileri", "Birimler"
-    ],
-    "Kullanim": [
-        "Tarih", "Islem", "Kullanici", "Detay"
-    ],
-    "Kullanicilar": [
-        "Kullanici_ID", "Ad_Soyad", "Email", "Rol", "Durum"
-    ],
+    "Listeler": ["Durum_Tipleri", "Odeme_Tipleri", "Urun_Kategorileri", "Birimler"],
+    "Kullanim": ["Tarih", "Islem", "Kullanici", "Detay"],
+    "Kullanicilar": ["Kullanici_ID", "Ad_Soyad", "Email", "Rol", "Durum"],
 }
 
 DEFAULT_LIST_ROWS = [
@@ -91,7 +86,7 @@ ALIASES: Dict[str, List[str]] = {
 
 def normalize_key(value: Any) -> str:
     text = str(value or "").strip().lower()
-    tr_map = str.maketrans("çğıöşüİ", "cgiosui")
+    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
     text = text.translate(tr_map)
     text = re.sub(r"[^a-z0-9]+", "_", text)
     return text.strip("_")
@@ -109,11 +104,6 @@ def date_text(d: Any) -> str:
     return str(d or "")
 
 
-def money(value: Any) -> str:
-    n = to_float(value)
-    return f"{n:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
 def to_float(value: Any) -> float:
     if value is None:
         return 0.0
@@ -126,7 +116,6 @@ def to_float(value: Any) -> float:
     text = re.sub(r"[^0-9,.-]", "", text)
     if not text:
         return 0.0
-    # Türkçe sayı: 12.345,67 -> 12345.67
     if "," in text and "." in text:
         text = text.replace(".", "").replace(",", ".")
     elif "," in text:
@@ -135,6 +124,11 @@ def to_float(value: Any) -> float:
         return float(text)
     except ValueError:
         return 0.0
+
+
+def money(value: Any) -> str:
+    n = to_float(value)
+    return f"{n:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def clean_empty_rows(df: pd.DataFrame, required_col: Optional[str] = None) -> pd.DataFrame:
@@ -155,6 +149,11 @@ def col_letter(index_1_based: int) -> str:
         n, rem = divmod(n - 1, 26)
         result = chr(65 + rem) + result
     return result
+
+
+def quote_sheet_name(title: str) -> str:
+    # A1 notation içinde özel karakter güvenliği.
+    return "'" + str(title).replace("'", "''") + "'"
 
 
 def next_id(df: pd.DataFrame, column: str, prefix: str) -> str:
@@ -179,7 +178,6 @@ def find_header_alias_map(actual_headers: List[str], expected_headers: List[str]
                 break
     return rename_map
 
-
 # -------------------------------
 # Google Sheets bağlantısı
 # -------------------------------
@@ -200,9 +198,6 @@ def get_spreadsheet_id() -> str:
 
 
 def get_service_account_info() -> Dict[str, Any]:
-    # Streamlit Cloud secrets içinde en sağlıklı format:
-    # [gcp_service_account]
-    # type = "service_account"
     for section_name in ["gcp_service_account", "service_account", "google_service_account"]:
         try:
             if section_name in st.secrets:
@@ -210,12 +205,11 @@ def get_service_account_info() -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Alternatif: tüm servis hesabı alanları root seviyede ise.
     required = [
         "type", "project_id", "private_key_id", "private_key", "client_email", "client_id",
         "auth_uri", "token_uri", "auth_provider_x509_cert_url", "client_x509_cert_url"
     ]
-    info = {}
+    info: Dict[str, Any] = {}
     for key in required:
         try:
             if key in st.secrets:
@@ -236,39 +230,50 @@ def get_gspread_client() -> gspread.Client:
     ]
     info = get_service_account_info()
     if "private_key" in info:
-        # Streamlit secrets bazen \n karakterlerini düz metin saklar.
         info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
     credentials = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(credentials)
 
 
-@st.cache_resource(show_spinner=False)
 def get_spreadsheet() -> gspread.Spreadsheet:
+    # Spreadsheet objesini cache'lemiyoruz. Önceki hatanın bir sebebi stale sheet metadata idi.
     client = get_gspread_client()
     return client.open_by_key(get_spreadsheet_id())
 
 
 def run_google_call(fn, *args, retries: int = 4, **kwargs):
     delay = 1.0
-    last_error = None
-    for attempt in range(retries):
+    last_error: Optional[Exception] = None
+    for _ in range(retries):
         try:
             return fn(*args, **kwargs)
         except APIError as exc:
             last_error = exc
             msg = str(exc)
-            # 429 quota veya 5xx geçici hatalarda bekle.
             if "429" in msg or "Quota exceeded" in msg or "500" in msg or "503" in msg:
                 time.sleep(delay)
                 delay *= 2
                 continue
             raise
-    raise last_error
+    if last_error:
+        raise last_error
+    raise RuntimeError("Google API çağrısı başarısız oldu.")
 
+
+def update_range(ws: gspread.Worksheet, range_name: str, values: List[List[Any]]) -> None:
+    # gspread 5/6 sürüm farkı için güvenli update.
+    try:
+        run_google_call(ws.update, values=values, range_name=range_name, value_input_option="USER_ENTERED")
+    except TypeError:
+        run_google_call(ws.update, range_name, values, value_input_option="USER_ENTERED")
 
 # -------------------------------
 # Sheet okuma/yazma
 # -------------------------------
+
+def empty_tables() -> Dict[str, pd.DataFrame]:
+    return {name: pd.DataFrame(columns=cols) for name, cols in SCHEMA.items()}
+
 
 def dataframe_from_values(sheet_name: str, values: List[List[Any]]) -> pd.DataFrame:
     expected = SCHEMA[sheet_name]
@@ -293,38 +298,73 @@ def dataframe_from_values(sheet_name: str, values: List[List[Any]]) -> pd.DataFr
         if col not in df.columns:
             df[col] = ""
 
-    # Beklenen kolonları öne al, ekstra kolonları sona bırak.
     extra_cols = [c for c in df.columns if c not in expected]
     df = df[expected + extra_cols]
     return clean_empty_rows(df)
 
 
+def get_worksheet_map(ss: gspread.Spreadsheet) -> Dict[str, gspread.Worksheet]:
+    worksheets = run_google_call(ss.worksheets)
+    norm_to_ws: Dict[str, gspread.Worksheet] = {}
+    for ws in worksheets:
+        norm_to_ws.setdefault(normalize_key(ws.title), ws)
+
+    result: Dict[str, gspread.Worksheet] = {}
+    for canonical in SCHEMA:
+        ws = norm_to_ws.get(normalize_key(canonical))
+        if ws is not None:
+            result[canonical] = ws
+    return result
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Google Sheets verileri okunuyor...")
-def load_all_tables(cache_buster: int = 0) -> Tuple[Dict[str, pd.DataFrame], Dict[str, str]]:
-    ss = get_spreadsheet()
-    ranges = [f"'{sheet}'!A1:Z{MAX_ROWS_PER_SHEET}" for sheet in SCHEMA]
+def load_all_tables(cache_buster: int = 0) -> Tuple[Dict[str, pd.DataFrame], Dict[str, str], List[str], Dict[str, str]]:
+    tables = empty_tables()
     errors: Dict[str, str] = {}
-    tables: Dict[str, pd.DataFrame] = {name: pd.DataFrame(columns=cols) for name, cols in SCHEMA.items()}
+    actual_titles: Dict[str, str] = {}
+
+    try:
+        ss = get_spreadsheet()
+        ws_map = get_worksheet_map(ss)
+    except Exception as exc:
+        for name in SCHEMA:
+            errors[name] = str(exc)
+        return tables, errors, list(SCHEMA.keys()), actual_titles
+
+    missing = [name for name in SCHEMA if name not in ws_map]
+
+    # Eksik sekmeleri okumaya çalışmıyoruz. Böylece "Unable to parse range" patlamıyor.
+    canonical_names = list(ws_map.keys())
+    ranges = []
+    for canonical in canonical_names:
+        actual_title = ws_map[canonical].title
+        actual_titles[canonical] = actual_title
+        end_col = col_letter(max(len(SCHEMA[canonical]), 26))
+        ranges.append(f"{quote_sheet_name(actual_title)}!A1:{end_col}{MAX_ROWS_PER_SHEET}")
+
+    if not ranges:
+        return tables, errors, missing, actual_titles
 
     try:
         response = run_google_call(ss.values_batch_get, ranges=ranges)
         value_ranges = response.get("valueRanges", [])
     except Exception as exc:
-        # Batch tamamen patlarsa ekranı düşürmeyelim.
-        for name in SCHEMA:
+        # Batch yine de patlarsa uygulamayı düşürmeyelim.
+        for name in canonical_names:
             errors[name] = str(exc)
-        return tables, errors
+        return tables, errors, missing, actual_titles
 
-    for sheet_name, vr in zip(SCHEMA.keys(), value_ranges):
+    for canonical, vr in zip(canonical_names, value_ranges):
         try:
-            tables[sheet_name] = dataframe_from_values(sheet_name, vr.get("values", []))
+            tables[canonical] = dataframe_from_values(canonical, vr.get("values", []))
         except Exception as exc:
-            errors[sheet_name] = str(exc)
-            tables[sheet_name] = pd.DataFrame(columns=SCHEMA[sheet_name])
-    return tables, errors
+            errors[canonical] = str(exc)
+            tables[canonical] = pd.DataFrame(columns=SCHEMA[canonical])
+
+    return tables, errors, missing, actual_titles
 
 
-def get_tables() -> Tuple[Dict[str, pd.DataFrame], Dict[str, str]]:
+def get_tables() -> Tuple[Dict[str, pd.DataFrame], Dict[str, str], List[str], Dict[str, str]]:
     return load_all_tables(st.session_state.get("cache_buster", 0))
 
 
@@ -333,15 +373,18 @@ def refresh_data() -> None:
     load_all_tables.clear()
 
 
-def get_worksheet(sheet_name: str) -> gspread.Worksheet:
+def resolve_worksheet(sheet_name: str) -> gspread.Worksheet:
     ss = get_spreadsheet()
-    return run_google_call(ss.worksheet, sheet_name)
+    ws_map = get_worksheet_map(ss)
+    if sheet_name in ws_map:
+        return ws_map[sheet_name]
+    raise WorksheetNotFound(sheet_name)
 
 
 def append_rows(sheet_name: str, row_dicts: List[Dict[str, Any]]) -> None:
     if not row_dicts:
         return
-    ws = get_worksheet(sheet_name)
+    ws = resolve_worksheet(sheet_name)
     headers = SCHEMA[sheet_name]
     rows = [[row.get(col, "") for col in headers] for row in row_dicts]
     run_google_call(ws.append_rows, rows, value_input_option="USER_ENTERED")
@@ -351,8 +394,63 @@ def append_row(sheet_name: str, row_dict: Dict[str, Any]) -> None:
     append_rows(sheet_name, [row_dict])
 
 
+def ensure_sheet_structure() -> Tuple[List[str], List[str], List[str]]:
+    """Eksik sekmeleri oluşturur, başlıkları yazar, eski Türkçe isimleri canonical isme çevirir."""
+    ss = get_spreadsheet()
+    created: List[str] = []
+    updated: List[str] = []
+    renamed: List[str] = []
+
+    # Her turda canlı worksheet listesi alıyoruz; stale metadata yok.
+    for canonical, headers in SCHEMA.items():
+        worksheets = run_google_call(ss.worksheets)
+        exact = next((w for w in worksheets if w.title == canonical), None)
+        norm_match = next((w for w in worksheets if normalize_key(w.title) == normalize_key(canonical)), None)
+
+        if exact is not None:
+            ws = exact
+        elif norm_match is not None:
+            ws = norm_match
+            try:
+                run_google_call(ws.update_title, canonical)
+                renamed.append(f"{norm_match.title} → {canonical}")
+            except APIError:
+                # Rename başarısız olsa bile aynı worksheet üzerinden devam edebiliriz.
+                pass
+        else:
+            try:
+                ws = run_google_call(ss.add_worksheet, title=canonical, rows=MAX_ROWS_PER_SHEET, cols=max(26, len(headers)))
+                created.append(canonical)
+            except APIError as exc:
+                # Yarış durumu / stale list: sekme aslında varsa addSheet hata verir. Sonra tekrar buluruz.
+                msg = str(exc)
+                if "already exists" in msg or "ALREADY_EXISTS" in msg:
+                    worksheets = run_google_call(ss.worksheets)
+                    ws = next((w for w in worksheets if normalize_key(w.title) == normalize_key(canonical)), None)
+                    if ws is None:
+                        raise
+                else:
+                    raise
+
+        end_col = col_letter(len(headers))
+        update_range(ws, f"A1:{end_col}1", [headers])
+        updated.append(canonical)
+
+        if canonical == "Listeler":
+            try:
+                current = run_google_call(ws.get, "A2:D20")
+                has_any = any(any(str(cell).strip() for cell in row) for row in current)
+            except Exception:
+                has_any = False
+            if not has_any:
+                update_range(ws, "A2:D7", DEFAULT_LIST_ROWS)
+
+    refresh_data()
+    return created, updated, renamed
+
+
 def update_order_payment_status(order_id: str, new_paid_total: float, order_total: float) -> None:
-    tables, _ = get_tables()
+    tables, _, _, _ = get_tables()
     orders = tables["Siparisler"].copy()
     if orders.empty or "Siparis_ID" not in orders.columns:
         return
@@ -360,51 +458,15 @@ def update_order_payment_status(order_id: str, new_paid_total: float, order_tota
     if not match:
         return
     df_index = match[0]
-    sheet_row = df_index + 2  # 1. satır header, dataframe index 0 => sheet row 2
+    sheet_row = df_index + 2
     kalan = max(order_total - new_paid_total, 0)
     odeme_durumu = "Ödendi" if kalan <= 0.01 else ("Kısmi Ödendi" if new_paid_total > 0 else "Ödenmedi")
 
     headers = SCHEMA["Siparisler"]
     c_odenen = col_letter(headers.index("Odenen") + 1)
-    c_kalan = col_letter(headers.index("Kalan") + 1)
     c_odeme = col_letter(headers.index("Odeme_Durumu") + 1)
-    ws = get_worksheet("Siparisler")
-    run_google_call(
-        ws.update,
-        f"{c_odenen}{sheet_row}:{c_odeme}{sheet_row}",
-        [[round(new_paid_total, 2), round(kalan, 2), odeme_durumu]],
-        value_input_option="USER_ENTERED",
-    )
-
-
-def ensure_sheet_structure() -> Tuple[List[str], List[str]]:
-    """Eksik sekmeleri oluşturur, headerları sabitler. Butonla manuel çalışır."""
-    ss = get_spreadsheet()
-    existing_titles = [ws.title for ws in run_google_call(ss.worksheets)]
-    created: List[str] = []
-    updated: List[str] = []
-
-    for sheet_name, headers in SCHEMA.items():
-        if sheet_name not in existing_titles:
-            ws = run_google_call(ss.add_worksheet, title=sheet_name, rows=MAX_ROWS_PER_SHEET, cols=max(26, len(headers)))
-            created.append(sheet_name)
-        else:
-            ws = run_google_call(ss.worksheet, sheet_name)
-
-        # Headerları her zaman A1'den itibaren net yazıyoruz.
-        end_col = col_letter(len(headers))
-        run_google_call(ws.update, f"A1:{end_col}1", [headers], value_input_option="USER_ENTERED")
-        updated.append(sheet_name)
-
-        if sheet_name == "Listeler":
-            current = run_google_call(ws.get, f"A2:D20")
-            has_any = any(any(str(cell).strip() for cell in row) for row in current)
-            if not has_any:
-                run_google_call(ws.update, "A2:D7", DEFAULT_LIST_ROWS, value_input_option="USER_ENTERED")
-
-    refresh_data()
-    return created, updated
-
+    ws = resolve_worksheet("Siparisler")
+    update_range(ws, f"{c_odenen}{sheet_row}:{c_odeme}{sheet_row}", [[round(new_paid_total, 2), round(kalan, 2), odeme_durumu]])
 
 # -------------------------------
 # İş mantığı
@@ -416,7 +478,7 @@ def active_options(df: pd.DataFrame, id_col: str, name_col: str, durum_col: str 
     d = df.copy().fillna("")
     if durum_col in d.columns:
         d = d[~d[durum_col].astype(str).str.lower().str.contains("pasif|iptal", na=False)]
-    options = []
+    options: List[str] = []
     for _, row in d.iterrows():
         rid = str(row.get(id_col, "")).strip()
         name = str(row.get(name_col, "")).strip()
@@ -458,7 +520,6 @@ def orders_with_live_payments(orders: pd.DataFrame, payments: pd.DataFrame) -> p
     )
     return out
 
-
 # -------------------------------
 # UI
 # -------------------------------
@@ -489,15 +550,31 @@ with st.sidebar:
     if st.button("🔄 Verileri yenile", use_container_width=True):
         refresh_data()
         st.rerun()
-    st.caption(f"Cache: {CACHE_TTL_SECONDS} sn | Tek batch okuma")
+    st.caption(f"Cache: {CACHE_TTL_SECONDS} sn | Eksik sekme toleranslı")
 
 st.title(APP_TITLE)
 
-tables, errors = get_tables()
+tables, errors, missing_sheets, actual_titles = get_tables()
+
+if missing_sheets:
+    st.error("Google Sheet içinde eksik sekmeler var. Aşağıdaki butona basınca eksikleri oluşturup başlıkları sabitleyeceğim.")
+    st.code(", ".join(missing_sheets))
+    if st.button("🧱 Eksik sekmeleri oluştur / başlıkları onar", type="primary"):
+        try:
+            created, updated, renamed = ensure_sheet_structure()
+            st.success("Sheet yapısı onarıldı. Sayfa yenileniyor...")
+            if created:
+                st.write("Oluşturulan:", ", ".join(created))
+            if renamed:
+                st.write("Yeniden adlandırılan:", ", ".join(renamed))
+            time.sleep(1)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Sheet onarılamadı: {exc}")
 
 if errors:
     with st.expander("⚠️ Google Sheets okuma uyarıları", expanded=True):
-        st.warning("Bazı sekmeler okunamadı. 429 görüyorsan 1-2 dakika bekleyip Verileri yenile butonuna bas. Bu sürüm eski koddaki sürekli okuma sorununu azaltmak için tek batch okuma kullanır.")
+        st.warning("Bazı sekmeler okunamadı. 429 kota hatası görüyorsan 1-2 dakika bekleyip Verileri yenile butonuna bas.")
         for sheet_name, err in errors.items():
             st.code(f"{sheet_name}: {err}")
 
@@ -562,7 +639,9 @@ elif page == "Yeni Sipariş":
     firma_options = active_options(firmalar, "Firma_ID", "Firma_Adi")
     product_options = active_options(products, "Urun_ID", "Urun_Adi")
 
-    if not firma_options:
+    if missing_sheets:
+        st.error("Önce eksik Sheet sekmelerini oluşturmalısın.")
+    elif not firma_options:
         st.error("Önce Firmalar sekmesine aktif firma eklemen gerekiyor.")
     elif not product_options:
         st.error("Önce Ürünler sekmesine aktif ürün eklemen gerekiyor.")
@@ -681,16 +760,17 @@ elif page == "Siparişler":
     else:
         c1, c2, c3 = st.columns(3)
         search = c1.text_input("Firma / Sipariş Ara")
-        status = c2.selectbox("Durum", ["Tümü"] + sorted([x for x in live_orders["Durum"].dropna().astype(str).unique() if x]))
+        statuses = sorted([x for x in live_orders["Durum"].dropna().astype(str).unique() if x]) if "Durum" in live_orders.columns else []
+        status = c2.selectbox("Durum", ["Tümü"] + statuses)
         pay_status = c3.selectbox("Ödeme", ["Tümü", "Ödenmedi", "Kısmi Ödendi", "Ödendi"])
 
         df = live_orders.copy()
         if search:
             s = search.lower()
             df = df[df.apply(lambda r: s in " ".join([str(r.get("Siparis_ID", "")), str(r.get("Firma_Adi", ""))]).lower(), axis=1)]
-        if status != "Tümü":
+        if status != "Tümü" and "Durum" in df.columns:
             df = df[df["Durum"].astype(str) == status]
-        if pay_status != "Tümü":
+        if pay_status != "Tümü" and "Odeme_Durumu_Canli" in df.columns:
             df = df[df["Odeme_Durumu_Canli"].astype(str) == pay_status]
 
         display = df.copy()
@@ -701,10 +781,10 @@ elif page == "Siparişler":
         st.dataframe(display[show_cols].iloc[::-1], use_container_width=True, hide_index=True)
 
         st.markdown("### Sipariş Detayı")
-        selected_order = st.selectbox("Sipariş seç", df["Siparis_ID"].astype(str).tolist() if not df.empty else [])
+        selected_order = st.selectbox("Sipariş seç", df["Siparis_ID"].astype(str).tolist() if not df.empty and "Siparis_ID" in df.columns else [])
         if selected_order:
-            detail_lines = lines[lines["Siparis_ID"].astype(str) == selected_order].copy() if not lines.empty else pd.DataFrame()
-            detail_payments = payments[payments["Siparis_ID"].astype(str) == selected_order].copy() if not payments.empty else pd.DataFrame()
+            detail_lines = lines[lines["Siparis_ID"].astype(str) == selected_order].copy() if not lines.empty and "Siparis_ID" in lines.columns else pd.DataFrame()
+            detail_payments = payments[payments["Siparis_ID"].astype(str) == selected_order].copy() if not payments.empty and "Siparis_ID" in payments.columns else pd.DataFrame()
             st.markdown("#### Kalemler")
             st.dataframe(detail_lines, use_container_width=True, hide_index=True)
             st.markdown("#### Ödemeler")
@@ -730,7 +810,9 @@ elif page == "Firmalar":
             durum = c9.selectbox("Durum", ["Aktif", "Pasif"])
             note = st.text_area("Not", key="firma_note")
             if st.form_submit_button("Firmayı kaydet", use_container_width=True):
-                if not firma_adi.strip():
+                if missing_sheets:
+                    st.error("Önce Sheet Kurulum ekranından eksik sekmeleri oluştur.")
+                elif not firma_adi.strip():
                     st.error("Firma adı zorunlu.")
                 else:
                     try:
@@ -775,7 +857,9 @@ elif page == "Ürünler":
             stok = st.text_input("Stok Kodu")
             note = st.text_area("Not", key="urun_note")
             if st.form_submit_button("Ürünü kaydet", use_container_width=True):
-                if not urun_adi.strip():
+                if missing_sheets:
+                    st.error("Önce Sheet Kurulum ekranından eksik sekmeleri oluştur.")
+                elif not urun_adi.strip():
                     st.error("Ürün adı zorunlu.")
                 else:
                     try:
@@ -819,7 +903,9 @@ elif page == "Ödemeler":
             tutar = st.number_input("Tutar", min_value=0.0, value=0.0, step=100.0)
             aciklama = st.text_area("Açıklama")
             if st.form_submit_button("Ödemeyi Kaydet", use_container_width=True):
-                if tutar <= 0:
+                if missing_sheets:
+                    st.error("Önce Sheet Kurulum ekranından eksik sekmeleri oluştur.")
+                elif tutar <= 0:
                     st.error("Tutar 0'dan büyük olmalı.")
                 else:
                     try:
@@ -853,28 +939,37 @@ elif page == "Ödemeler":
 # ---------- Sheet Kurulum ----------
 elif page == "Sheet Kurulum":
     st.subheader("Google Sheets Kurulum ve Kontrol")
-    st.markdown(
-        """
-        Bu sayfa sistemi sıfırdan sabitlemek için var. Eski otomatik başlık arama mantığı kaldırıldı.
-        Kod artık aşağıdaki sabit sekme ve kolon şemasına göre çalışıyor.
-        """
-    )
+    st.markdown("Bu sayfa Sheet'i sıfırdan sabitlemek için var. Eksik sekmeler oluşturulur, başlıklar 1. satıra yazılır, mevcut kayıtlar silinmez.")
 
     c1, c2 = st.columns([1, 2])
     with c1:
         if st.button("🧱 Sheet yapısını oluştur / onar", type="primary", use_container_width=True):
             try:
-                created, updated = ensure_sheet_structure()
+                created, updated, renamed = ensure_sheet_structure()
                 st.success("Sheet yapısı hazırlandı.")
                 if created:
                     st.write("Oluşturulan sekmeler:", ", ".join(created))
-                st.write("Güncellenen sekmeler:", ", ".join(updated))
+                if renamed:
+                    st.write("Yeniden adlandırılan sekmeler:", ", ".join(renamed))
+                st.write("Başlığı güncellenen sekmeler:", ", ".join(updated))
+                time.sleep(1)
+                st.rerun()
             except Exception as exc:
                 st.error(f"Sheet yapısı hazırlanamadı: {exc}")
     with c2:
-        st.info("Bu işlem sekmelerin 1. satırına doğru başlıkları yazar. Alt satırlardaki kayıtları silmez. Yine de büyük değişiklikten önce Google Sheet'in bir kopyasını almak mantıklı.")
+        st.info("Bu işlem kayıtları silmez. Sadece eksik sekme oluşturur ve 1. satırdaki kolon başlıklarını sabitler.")
 
-    st.markdown("### Beklenen sekme ve kolonlar")
+    st.markdown("### Mevcut sekme eşleşmeleri")
+    rows = []
+    for name in SCHEMA:
+        rows.append({
+            "Beklenen Sekme": name,
+            "Mevcut Sekme": actual_titles.get(name, "YOK"),
+            "Durum": "OK" if name in actual_titles else "Eksik",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### Beklenen kolonlar")
     for sheet_name, headers in SCHEMA.items():
         with st.expander(sheet_name, expanded=False):
             st.code(" | ".join(headers))
