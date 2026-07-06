@@ -1,28 +1,25 @@
-# Günday's Home Sipariş Takip - Google Sheets Sürümü
+# Günday's Home Sipariş Takip - Google Sheets V3 Fix
 
-Bu sürüm verileri Google Sheets dosyanıza yazar/okur.
+Bu paket Streamlit Cloud kurulum hatasını düzeltmek için hazırlanmıştır.
 
-Gerekli Streamlit Secrets:
+## Önemli
 
-```toml
-SPREADSHEET_ID = "GOOGLE_SHEET_ID"
+GitHub reposunda şu dosyalar varsa silin:
 
-[gcp_service_account]
-type = "service_account"
-project_id = "..."
-private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-client_email = "...iam.gserviceaccount.com"
-client_id = "..."
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "..."
-universe_domain = "googleapis.com"
-```
+- `pyproject.toml`
+- `uv.lock`
+- `.python-version`
 
-İlk giriş:
-- Kullanıcı adı: admin
-- Şifre: admin123
+Sonra bu paketteki dosyaları yükleyin:
 
-İlk girişten sonra panelden şifreyi değiştirin.
+- `streamlit_app.py`
+- `requirements.txt`
+- `README.md`
+- `.streamlit/config.toml`
+
+Secrets tarafına dokunmanıza gerek yoktur.
+
+## İlk giriş
+
+- Kullanıcı adı: `admin`
+- Şifre: `admin123`
