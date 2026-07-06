@@ -1,37 +1,5 @@
-# Günday's Home Sipariş Takip - V4 Kota Düzeltmesi
-
-Bu sürüm Google Sheets API kota taşmasını azaltmak için optimize edildi.
-
-## Değişiklikler
-
-- Tüm Google Sheets sekmeleri tek batch okuma ile çekilir.
-- Her sayfa yenilemede tekrar tekrar Google Sheets okunmaz.
-- Veriler 120 saniye cache'lenir.
-- Firma / ürün / sipariş silme ve güncelleme korunur.
-- Excel dışa aktarım için openpyxl requirements içinde kalır.
-- GitHub'da pyproject.toml, uv.lock, .python-version dosyaları kullanılmamalıdır.
-
-## Gerekli Streamlit Secrets
-
-```
-SPREADSHEET_ID = "GOOGLE_SHEET_ID"
-
-[gcp_service_account]
-type = "service_account"
-project_id = "..."
-private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-client_email = "...iam.gserviceaccount.com"
-client_id = "..."
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "..."
-universe_domain = "googleapis.com"
-```
-
-## İlk giriş
-
-- Kullanıcı adı: admin
-- Şifre: admin123
-
+streamlit>=1.36.0
+pandas>=2.2.0
+gspread>=6.1.2
+google-auth>=2.30.0
+openpyxl>=3.1.2
