@@ -1,25 +1,68 @@
-# 🎈 Blank app template
+# Günday's Home Sipariş Takip - Streamlit MVP
 
-A simple Streamlit app template for you to modify!
+Bu proje Günday's Home için web tabanlı sipariş takip panelidir. PC ve mobil tarayıcıdan kullanılabilir.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Özellikler
 
-### How to run it on your own machine
+- Admin giriş ekranı
+- Firma / müşteri kartları
+- Ürün kartları
+- Yeni sipariş oluşturma
+- Siparişe birden fazla ürün kalemi ekleme
+- Sipariş durumu ve ödeme durumu güncelleme
+- Dashboard metrikleri
+- Firma ve ürün bazlı raporlar
+- Excel rapor indirme
+- SQLite veritabanı yedeği indirme
+- Mobil uyumlu arayüz
 
-Prerequisite: install `uv` if you don't already have it.
+## Yerelde çalıştırma
 
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
 ```
-$ curl -LsSf https://astral.sh/uv/install.sh | sh
+
+Tarayıcıda açılır:
+
+```text
+http://localhost:8501
 ```
 
-1. Sync the dependencies
+İlk giriş:
 
-   ```
-   $ uv sync
-   ```
+```text
+Kullanıcı adı: admin
+Şifre: admin123
+```
 
-2. Run the app
+Giriş yaptıktan sonra **Yedek / Ayarlar > Şifre değiştir** bölümünden şifreyi değiştir.
 
-   ```
-   $ uv run streamlit run streamlit_app.py
-   ```
+## Streamlit Cloud'a yükleme
+
+1. GitHub'da yeni bir repo oluştur.
+2. Bu klasördeki dosyaları repoya yükle:
+   - `streamlit_app.py`
+   - `requirements.txt`
+   - `.streamlit/config.toml`
+   - `README.md`
+3. Streamlit Cloud'da `Create app` / `New app` seç.
+4. GitHub reposunu seç.
+5. Main file path alanına şunu yaz:
+
+```text
+streamlit_app.py
+```
+
+6. App URL alanında istediğin kısa adı kullan:
+
+```text
+gundayssiparistakip
+```
+
+7. Deploy butonuna bas.
+
+## Önemli not
+
+Bu MVP sürüm SQLite dosyasıyla çalışır. Bilgisayarda kullanım için uygundur. Streamlit Cloud'da test ve düşük yoğunluklu kullanım için çalışır; ancak kalıcı ve profesyonel veri saklama için sonraki sürümde Supabase, Neon PostgreSQL veya Google Sheets bağlantısı önerilir.
+
