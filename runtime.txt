@@ -1,1 +1,31 @@
-python-3.12
+# Günday's Home Sipariş Takip - V8 Sabit Şema
+
+Bu sürüm Google Sheets sekmelerini sabit şemaya göre okur/yazar.
+
+## Gerekli Streamlit Secrets
+
+```toml
+SPREADSHEET_ID = "1nOIO-sodcXTx1v-dp1Do9Zj-mev6O5rbYkyT204m-Vk"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "...iam.gserviceaccount.com"
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+universe_domain = "googleapis.com"
+```
+
+## İlk giriş
+
+- Kullanıcı adı: admin
+- Şifre: admin123
+
+## Önemli
+
+GitHub'da `pyproject.toml`, `uv.lock`, `.python-version` dosyaları varsa silin.
